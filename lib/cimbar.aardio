@@ -1,0 +1,285 @@
+import gdip.bitmap;
+namespace cimbar;
+
+// 将 DLL 所在目录加入搜索路径，确保依赖 DLL（如 libwinpthread-1.dll）可被找到
+var dllDir = ..io.fullpath("~/dll");
+var kernel32 = ..raw.loadDll("kernel32.dll");
+var setDllDirectory = kernel32.api("SetDllDirectoryW","int(str)");
+setDllDirectory(dllDir);
+
+var dll = ..raw.loadDll("~/dll/cimbar_dll.dll",,"cdecl");
+
+/*编码 API 声明{{*/
+var _encode_file = dll.api("cimbar_encode_file","int(str filename, int mode_val, int compression)");
+var _encode_next_frame = dll.api("cimbar_encode_next_frame","int()");
+var _encode_get_frame_width = dll.api("cimbar_encode_get_frame_width","int()");
+var _encode_get_frame_height = dll.api("cimbar_encode_get_frame_height","int()");
+var _encode_get_frame_size = dll.api("cimbar_encode_get_frame_size","int()");
+var _encode_copy_frame = dll.api("cimbar_encode_copy_frame","int(pointer buffer, int bufsize)");
+var _encode_copy_frame_bgra = dll.api("cimbar_encode_copy_frame_bgra","int(pointer buffer, int bufsize)");
+var _encode_get_info = dll.api("cimbar_encode_get_info","int(int & recommended, int & current, int & blocks_required, int & blocks_generated)");
+var _encode_create_hbitmap = dll.api("cimbar_encode_create_hbitmap","pointer()");
+var _encode_cleanup = dll.api("cimbar_encode_cleanup","void()");
+/*}}*/
+
+/*解码 API 声明{{*/
+var _decode_configure = dll.api("cimbar_decode_configure","int(int mode_val)");
+var _decode_get_bufsize = dll.api("cimbar_decode_get_bufsize","int()");
+var _decode_scan_extract = dll.api("cimbar_decode_scan_extract","int(pointer imgdata, int imgw, int imgh, int format, pointer bufspace, int bufsize)");
+var _decode_fountain = dll.api("cimbar_decode_fountain","int64(pointer buffer, int size)");
+var _decode_get_filesize = dll.api("cimbar_decode_get_filesize","INT(INT id)");
+var _decode_get_filename = dll.api("cimbar_decode_get_filename","int(INT id, pointer filename, int fnsize)");
+var _decode_get_decompress_bufsize = dll.api("cimbar_decode_get_decompress_bufsize","int()");
+var _decode_decompress_read = dll.api("cimbar_decode_decompress_read","int(INT id, pointer buffer, int size)");
+var _decode_cleanup = dll.api("cimbar_decode_cleanup","void()");
+var _decode_image = dll.api("cimbar_decode_image","int64(str img_path, int mode_val)");
+var _decode_get_num_streams = dll.api("cimbar_decode_get_num_streams","int()");
+var _decode_get_stream_progress = dll.api("cimbar_decode_get_stream_progress","int(int stream_idx)");
+var _decode_get_num_done = dll.api("cimbar_decode_get_num_done","int()");
+var _decode_get_scan_result = dll.api("cimbar_decode_get_scan_result","int()");
+/*}}*/
+
+/*摄像头 API 声明{{*/
+var _cam_open = dll.api("cimbar_cam_open","int(int index)");
+var _cam_grab_hbitmap = dll.api("cimbar_cam_grab_hbitmap","pointer()");
+var _cam_close = dll.api("cimbar_cam_close","void()");
+var _cam_get_width = dll.api("cimbar_cam_get_width","int()");
+var _cam_get_height = dll.api("cimbar_cam_get_height","int()");
+/*}}*/
+
+/*编码模式常量{{*/
+MODE_4C = 4;
+MODE_BU = 66;
+MODE_BM = 67;
+MODE_B = 68;
+
+/*像素格式常量（用于 decodeFrame 的 format 参数）*/
+FORMAT_RGB = 3;
+FORMAT_RGBA = 4;
+FORMAT_NV12 = 12;
+FORMAT_YUV420P = 420;
+/*}}*/
+
+encodeFile = function(filePath, mode, compression){
+	if(!filePath) error("参数 @1 文件路径不能为空",2);
+	mode := MODE_B;
+	compression := 16;
+
+	var ret = _encode_file(filePath, mode, compression);
+	if(ret < 0) return false;
+	return true;
+};
+
+nextFrameBitmap = function(){
+	var ret = _encode_next_frame();
+	if(ret <= 0) return null;
+
+	// DLL 端创建 HBITMAP（32位 BGRA DIB Section）
+	var hBitmap = _encode_create_hbitmap();
+	if(!hBitmap) return null;
+
+	// GdipCreateBitmapFromHBITMAP 会复制像素数据到 GDI+ 内部缓冲区
+	// 创建后 HBITMAP 可立即释放，位图数据由 GDI+ 独立管理
+	var bmp = ..gdip.bitmap(hBitmap);
+	::DeleteObject(hBitmap);
+
+	return bmp;
+};
+
+encodeCleanup = function(){
+	_encode_cleanup();
+};
+
+getEncodeInfo = function(){
+	var recommended = 0;
+	var current = 0;
+	var blocksRequired = 0;
+	var blocksGenerated = 0;
+
+	var ret, recommended, current, blocksRequired, blocksGenerated = _encode_get_info(recommended, current, blocksRequired, blocksGenerated);
+	if(ret < 0) return null;
+
+	return {
+		recommended = recommended;
+		current = current;
+		blocksRequired = blocksRequired;
+		blocksGenerated = blocksGenerated;
+	};
+};
+
+decodeConfigure = function(mode){
+	mode := MODE_B;
+	var ret = _decode_configure(mode);
+	if(ret < 0) return false;
+	return true;
+};
+
+decodeFrame = function(rgbData, width, height, format){
+	if(!rgbData) error("参数 @1 图像数据不能为空",2);
+	if(!width || !height) error("参数 @2,@3 宽高不能为零",2);
+	format := FORMAT_RGB;
+
+	// 获取解码所需缓冲区大小
+	var bufsize = _decode_get_bufsize();
+	if(bufsize <= 0) return null;
+
+	var bufspace = ..raw.buffer(bufsize);
+
+	// 获取图像数据指针
+	var imgPtr;
+	if(type(rgbData) == type.pointer){
+		imgPtr = rgbData;
+	}
+	elseif(type(rgbData) == type.buffer || type(rgbData) == type.string){
+		imgPtr = ..raw.toPointer(rgbData);
+	}
+	else {
+		error("参数 @1 类型不支持，需要 pointer/buffer/string",2);
+	}
+
+	var bytesDecoded = _decode_scan_extract(imgPtr, width, height, format, ..raw.toPointer(bufspace), bufsize);
+	if(bytesDecoded <= 0) return null;
+
+	// 将提取的数据送入喷泉码解码器
+	var fileId = _decode_fountain(..raw.toPointer(bufspace), bytesDecoded);
+
+	if(fileId > 0){
+		// 解码完成，返回文件 ID
+		return { fileId = tonumber(fileId) };
+	}
+	elseif(fileId == 0){
+		// 需要更多帧数据
+		return { bytesDecoded = bytesDecoded };
+	}
+
+	// 出错
+	return null;
+};
+
+decodeSave = function(fileId, outputPath){
+	if(!fileId) error("参数 @1 文件 ID 不能为空",2);
+	if(!outputPath) error("参数 @2 输出路径不能为空",2);
+
+	// 获取解压缓冲区大小
+	var decompressBufsize = _decode_get_decompress_bufsize();
+	if(decompressBufsize <= 0) return false;
+
+	// 获取压缩文件大小，用于估算解压后大小
+	var compressedSize = _decode_get_filesize(fileId);
+	if(compressedSize <= 0) return false;
+
+	// 分配足够大的缓冲区（解压后数据通常比压缩数据大）
+	var outSize = math.max(decompressBufsize, compressedSize * 4);
+	var outBuffer = ..raw.buffer(outSize);
+
+	var bytesRead = _decode_decompress_read(fileId, ..raw.toPointer(outBuffer), outSize);
+	if(bytesRead <= 0) return false;
+
+	..string.save(outputPath, ..raw.tostring(outBuffer, 1, bytesRead));
+	return true;
+};
+
+decodeCleanup = function(){
+	_decode_cleanup();
+};
+
+decodeGetScanResult = function(){
+	return _decode_get_scan_result();
+};
+
+getDecodeProgress = function(){
+	var numStreams = _decode_get_num_streams();
+	if(numStreams <= 0) return 0;
+
+	// 取所有流的最大进度
+	var maxProgress = 0;
+	for(i=0;numStreams-1){
+		var p = _decode_get_stream_progress(i);
+		if(p > maxProgress) maxProgress = p;
+	}
+
+	return maxProgress;
+};
+
+decodeFrameFromBitmap = function(bmp, format){
+	if(!bmp) error("参数 @1 gdip.bitmap 对象不能为空",2);
+	format := FORMAT_RGB;
+
+	var bmpData = bmp.lockMemory(,0x21808/*_GdipPixelFormat24bppRGB*/,1/*_GdipImageLockModeRead*/,3);
+	if(!bmpData) return null;
+
+	var result = decodeFrame(bmpData.scan0, bmpData.width, bmpData.height, format);
+	bmp.unlockMemory(bmpData);
+	return result;
+};
+
+decodeImage = function(imgPath, mode){
+	if(!imgPath) error("参数 @1 图像路径不能为空",2);
+	mode := 0;
+
+	var fileId = _decode_image(imgPath, mode);
+
+	if(fileId > 0){
+		return { fileId = tonumber(fileId) };
+	}
+	elseif(fileId == 0){
+		return { bytesDecoded = 0 };
+	}
+
+	return null;
+};
+
+/*===== 摄像头 API =====*/
+
+camOpen = function(index){
+	index := 0;
+	var ret = _cam_open(index);
+	if(ret < 0) return false;
+	return true;
+};
+
+camGrabBitmap = function(){
+	var hBitmap = _cam_grab_hbitmap();
+	if(!hBitmap) return null;
+
+	// GdipCreateBitmapFromHBITMAP 会复制像素数据到 GDI+ 内部缓冲区
+	var bmp = ..gdip.bitmap(hBitmap);
+	::DeleteObject(hBitmap);
+
+	return bmp;
+};
+
+camClose = function(){
+	_cam_close();
+};
+
+camGetWidth = function(){
+	return _cam_get_width();
+};
+
+camGetHeight = function(){
+	return _cam_get_height();
+};
+
+/**intellisense()
+cimbar = cimbar DLL 封装模块，提供编码/解码高级接口
+cimbar.MODE_4C = 编码模式：4色(4)
+cimbar.MODE_BU = 编码模式：单色无漂移(66)
+cimbar.MODE_BM = 编码模式：单色中漂移(67)
+cimbar.MODE_B = 编码模式：单色大漂移(68)，默认模式
+cimbar.FORMAT_RGB = 像素格式：RGB(3)
+cimbar.FORMAT_RGBA = 像素格式：RGBA(4)
+cimbar.FORMAT_NV12 = 像素格式：YUV_NV12(12)
+cimbar.FORMAT_YUV420P = 像素格式：YUV420p(420)
+cimbar.encodeFile(.(文件路径,编码模式,压缩级别) = 编码文件，准备生成帧序列\n参数 @1 文件路径（必填）\n参数 @2 编码模式，默认 MODE_B\n参数 @3 zstd 压缩级别(0-22)，默认 16\n成功返回 true，失败返回 false
+cimbar.nextFrameBitmap() = 生成下一帧并返回 gdip.bitmap 对象（BGRA 格式）\n无更多帧时返回 null\n需先调用 encodeFile 初始化编码
+cimbar.encodeCleanup() = 清理编码状态，释放资源
+cimbar.getEncodeInfo() = 获取编码信息\n成功返回 {recommended;current;blocksRequired;blocksGenerated}\n失败返回 null
+cimbar.decodeConfigure(.(编码模式) = 配置解码模式\n参数默认 MODE_B\n成功返回 true
+cimbar.decodeFrame(.(图像数据,宽度,高度,像素格式) = 解码一帧摄像头数据\n参数 @1 图像数据(pointer/buffer/string)\n参数 @2,@3 图像宽高\n参数 @4 像素格式，默认 FORMAT_RGB\n解码完成返回 {fileId=数字}\n需要更多帧返回 {bytesDecoded=数字}\n失败返回 null
+cimbar.decodeFrameFromBitmap(.(gdip.bitmap对象,像素格式) = 从 gdip.bitmap 对象解码一帧\n参数 @1 gdip.bitmap 对象\n参数 @2 像素格式，默认 FORMAT_RGB\n内部自动锁定像素数据并传给解码器\n解码完成返回 {fileId=数字}\n需要更多帧返回 {bytesDecoded=数字}\n失败返回 null
+cimbar.decodeSave(.(文件ID,输出路径) = 保存解码文件\n参数 @1 解码返回的 fileId\n参数 @2 输出文件路径\n成功返回 true，失败返回 false
+cimbar.decodeCleanup() = 清理解码状态，释放资源
+cimbar.getDecodeProgress() = 获取解码进度(0-100)\n返回所有流中的最大进度值
+cimbar.decodeImage(.(图像路径,编码模式) = 一步解码图像文件\n参数 @1 图像文件路径\n参数 @2 编码模式，0=自动检测\n解码完成返回 {fileId=数字}\n需要更多帧返回 {bytesDecoded=0}\n失败返回 null
+end intellisense**/

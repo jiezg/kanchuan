@@ -1,0 +1,15 @@
+# 构建产物（CMake 中间文件、OpenCV 源码和编译产物）
+opencv-build/
+opencv-dist/
+lc-build/
+
+# IDE 工作文件
+.trae/
+
+# aardio 编译/发布产物
+.build/
+dist/
+
+# 临时文件
+*.tmp
+*.bak

@@ -1,0 +1,354 @@
+import win.ui;
+import win.ui.minmax;
+import cimbar;
+import gdip;
+import fsys.dlg;
+import mouse.screenArea;
+/*DSG{{*/
+mainForm = win.form(text="看穿";right=649;bottom=753;acceptfiles=1)
+mainForm.add(
+button1={cls="button";text="打开文件";left=28;top=29;right=148;bottom=59;dl=1;dt=1;z=1};
+button2={cls="button";text="划区截图";left=165;top=29;right=285;bottom=59;dl=1;dt=1;z=2};
+button3={cls="button";text="图像解码";left=332;top=29;right=452;bottom=59;dr=1;dt=1;z=3};
+combobox={cls="combobox";left=500;top=32;right=620;bottom=58;dr=1;dt=1;edge=1;items={};mode="dropdown";z=6};
+custom={cls="custom";text="画布";left=25;top=128;right=625;bottom=728;z=4};
+groupbox={cls="groupbox";text="编码";left=13;top=6;right=302;bottom=68;dl=1;dt=1;edge=1;z=8};
+groupbox2={cls="groupbox";text="解码";left=316;top=6;right=468;bottom=68;dr=1;dt=1;edge=1;z=9};
+groupbox3={cls="groupbox";text="模式";left=484;top=6;right=636;bottom=68;dr=1;dt=1;edge=1;z=10};
+progress={cls="progress";left=25;top=106;right=625;bottom=116;dl=1;dr=1;dt=1;edge=1;max=100;min=0;z=7};
+static={cls="static";text="试试拖放一个小文件!";left=25;top=74;right=625;bottom=101;dl=1;dr=1;dt=1;transparent=1;z=5}
+)
+/*}}*/
+
+var MARGIN_LEFT = 25;
+var MARGIN_RIGHT = 25;
+var MARGIN_BOTTOM = 25;
+var MARGIN_TOP_CUSTOM = 128;
+
+var canvasSide = 600;
+
+var appState = {
+	mode = "idle";
+	currentBitmap = null;
+	offscreenBitmap = null;
+	frameRate = 10;
+	encodeTimer = null;
+	decodeTimer = null;
+	encodeFilePath = null;
+	encodeMode = 68;
+	mirrorFlip = false;
+};
+
+mainForm.combobox.items = {"B";"Bu";"Bm";"4C"};
+mainForm.combobox.selIndex = 1;
+
+getModeValue = function(){
+	var sel = mainForm.combobox.selText;
+	if(sel == "4C") return cimbar.MODE_4C;
+	if(sel == "Bu") return cimbar.MODE_BU;
+	if(sel == "Bm") return cimbar.MODE_BM;
+	return cimbar.MODE_B;
+};
+
+// 根据窗口客户区尺寸重新布局 custom 控件（保持正方形、与底部固定距离）
+layoutCustom = function(){
+	var cx = mainForm.clientRect.width();
+	var cy = mainForm.clientRect.height();
+	var customW = cx - MARGIN_LEFT - MARGIN_RIGHT;
+	var customH = cy - MARGIN_TOP_CUSTOM - MARGIN_BOTTOM;
+	canvasSide = math.max(math.min(customW, customH), 100);
+	var left = math.floor((cx - canvasSide) / 2);
+	var top = cy - MARGIN_BOTTOM - canvasSide;
+	mainForm.custom.setPos(left, top, canvasSide, canvasSide);
+	if(appState.offscreenBitmap){
+		appState.offscreenBitmap.dispose();
+		appState.offscreenBitmap = null;
+	}
+};
+
+ensureOffscreen = function(){
+	if(canvasSide <= 0) return null;
+	if(!appState.offscreenBitmap || appState.offscreenBitmap.width != canvasSide){
+		if(appState.offscreenBitmap) appState.offscreenBitmap.dispose();
+		appState.offscreenBitmap = gdip.bitmap(canvasSide, canvasSide);
+	}
+	return appState.offscreenBitmap;
+};
+
+drawCanvas = function(){
+	if(canvasSide <= 0) return;
+	var offscreen = ensureOffscreen();
+	if(!offscreen) return;
+
+	var g = offscreen.getGraphics();
+	if(appState.currentBitmap){
+		var bmpW = appState.currentBitmap.width;
+		var bmpH = appState.currentBitmap.height;
+		// 取画面中居中最大的正方形区域，避免非正方形画面拉伸畸变
+		var side = math.min(bmpW, bmpH);
+		var srcX = math.floor((bmpW - side) / 2);
+		var srcY = math.floor((bmpH - side) / 2);
+
+		if(appState.mirrorFlip){
+			// 水平镜像：通过 GDI+ 世界变换矩阵实现翻转
+			g.scale(-1, 1);
+			g.translate(-canvasSide, 0);
+			g.drawImageRectRect(appState.currentBitmap, 0, 0, canvasSide, canvasSide, srcX, srcY, side, side);
+			g.resetTransform();
+		}
+		else {
+			g.drawImageRectRect(appState.currentBitmap, 0, 0, canvasSide, canvasSide, srcX, srcY, side, side);
+		}
+	}
+	else {
+		g.clear(0xFF2B2B2B);
+	}
+
+	// 解码模式下叠加四角锚点指示器
+	if(appState.mode == "decoding"){
+		var scanResult = cimbar.decodeGetScanResult();
+		var anchorColor;
+		if(scanResult == 1) anchorColor = 0xFF00FF00;      // 绿色：提取成功
+		elseif(scanResult == 2) anchorColor = 0xFFFFFF00;   // 黄色：需锐化
+		else anchorColor = 0xFFFFFFFF;                      // 白色：未检测到锚点
+
+		var cornerLen = math.max(math.floor(canvasSide * 0.08), 10);
+     		var pen = gdip.pen(anchorColor, 5);
+		// 左上角 L 形
+		g.drawLine(pen, 0, 0, cornerLen, 0);
+		g.drawLine(pen, 0, 0, 0, cornerLen);
+		// 右上角 L 形
+		g.drawLine(pen, canvasSide-1, 0, canvasSide-1-cornerLen, 0);
+		g.drawLine(pen, canvasSide-1, 0, canvasSide-1, cornerLen);
+		// 左下角 L 形
+		g.drawLine(pen, 0, canvasSide-1, cornerLen, canvasSide-1);
+		g.drawLine(pen, 0, canvasSide-1, 0, canvasSide-1-cornerLen);
+		// 右下角 L 形
+		g.drawLine(pen, canvasSide-1, canvasSide-1, canvasSide-1-cornerLen, canvasSide-1);
+		g.drawLine(pen, canvasSide-1, canvasSide-1, canvasSide-1, canvasSide-1-cornerLen);
+		pen.delete();
+	}
+
+	g.delete();
+
+	var gDst = gdip.graphics(mainForm.custom.hwnd);
+	gDst.drawImageRect(offscreen, 0, 0, canvasSide, canvasSide);
+	gDst.delete();
+};
+
+startEncoding = function(filePath){
+	stopAll();
+
+	var mode = getModeValue();
+	appState.encodeFilePath = filePath;
+	appState.encodeMode = mode;
+
+	if(!cimbar.encodeFile(filePath, mode, 16)){
+		mainForm.static.text = "编码失败！请检查文件路径和格式。";
+		return;
+	}
+
+	appState.mode = "encoding";
+	mainForm.static.text = "正在编码...";
+	mainForm.progress.pos = 0;
+
+	var interval = math.max(math.floor(1000 / appState.frameRate), 30);
+	appState.encodeTimer = mainForm.setInterval(interval, function(){
+		var bmp = cimbar.nextFrameBitmap();
+		if(!bmp){
+			cimbar.encodeFile(appState.encodeFilePath, appState.encodeMode, 16);
+			return;
+		}
+
+		if(appState.currentBitmap) appState.currentBitmap.dispose();
+		appState.currentBitmap = bmp;
+		drawCanvas();
+
+		var info = cimbar.getEncodeInfo();
+		if(info){
+			var displayFrame = info.recommended > 0
+				? ((info.current - 1) % info.recommended) + 1
+				: info.current;
+			var pct = info.recommended > 0
+				? math.floor(displayFrame * 100 / info.recommended)
+				: 0;
+			mainForm.progress.pos = math.min(pct, 100);
+			mainForm.static.text = string.format("编码中 帧:%d/%d", displayFrame, info.recommended);
+		}
+	});
+};
+
+startDecoding = function(){
+	stopAll();
+
+	var mode = getModeValue();
+	if(!cimbar.decodeConfigure(mode)){
+		mainForm.static.text = "解码配置失败！";
+		return;
+	}
+
+	appState.mode = "decoding";
+	mainForm.static.text = "正在启动摄像头...";
+	mainForm.progress.pos = 0;
+
+	// 使用 Media Foundation 打开摄像头（DLL 内部实现，不依赖 VFW）
+	if(!cimbar.camOpen(0)){
+		mainForm.static.text = "无法打开摄像头！";
+		appState.mode = "idle";
+		return;
+	}
+
+	mainForm.static.text = "摄像头已启动，正在解码...";
+
+	// 定时器：抓帧 + 预览 + 解码
+	appState.decodeTimer = mainForm.setInterval(100, function(){
+		decodeOneFrame();
+	});
+};
+
+decodeOneFrame = function(){
+	// 从 DLL 摄像头 API 抓取当前帧（HBITMAP → gdip.bitmap）
+	var bmp = cimbar.camGrabBitmap();
+	if(!bmp) return;
+
+	// 更新画布预览
+	if(appState.currentBitmap) appState.currentBitmap.dispose();
+	appState.currentBitmap = bmp;
+	drawCanvas();
+
+	// 解码当前帧
+	var result = cimbar.decodeFrameFromBitmap(bmp);
+
+	var progress = cimbar.getDecodeProgress();
+	mainForm.progress.pos = progress;
+
+	var scanResult = cimbar.decodeGetScanResult();
+	if(scanResult == 2){
+		mainForm.static.text = string.format("解码中... 进度:%d%% 请调整距离或对焦", progress);
+	}
+	elseif(scanResult == 1){
+		mainForm.static.text = string.format("解码中... 进度:%d%%", progress);
+	}
+	else {
+		mainForm.static.text = string.format("对齐锚点中... 进度:%d%%", progress);
+	}
+
+	if(result && result.fileId){
+		mainForm.static.text = "解码完成！正在保存...";
+		stopAll();
+		var savePath = fsys.dlg.save("All files|*.*||", , mainForm.hwnd);
+		if(savePath){
+			if(cimbar.decodeSave(result.fileId, savePath)){
+				mainForm.static.text = "文件已保存到：" + savePath;
+			}
+			else {
+				mainForm.static.text = "保存失败！";
+			}
+		}
+		else {
+			mainForm.static.text = "已取消保存。";
+		}
+	}
+};
+
+stopAll = function(){
+	if(appState.encodeTimer){
+		mainForm.clearInterval(appState.encodeTimer);
+		appState.encodeTimer = null;
+	}
+	if(appState.decodeTimer){
+		mainForm.clearInterval(appState.decodeTimer);
+		appState.decodeTimer = null;
+	}
+	cimbar.camClose();
+	cimbar.encodeCleanup();
+	cimbar.decodeCleanup();
+	if(appState.currentBitmap){
+		appState.currentBitmap.dispose();
+		appState.currentBitmap = null;
+	}
+	if(appState.offscreenBitmap){
+		appState.offscreenBitmap.dispose();
+		appState.offscreenBitmap = null;
+	}
+	appState.mode = "idle";
+	appState.encodeFilePath = null;
+	appState.mirrorFlip = false;
+	drawCanvas();
+};
+
+// 阻止系统擦除 custom 控件背景，避免底色闪烁
+mainForm.custom.onEraseBkgnd = function(hwnd, message, wParam, lParam){
+	return 1;
+};
+
+// custom 控件需要重绘时主动调用 drawCanvas
+mainForm.custom.onPaint = function(hdc, rcPaint, fErase, width, height){
+	drawCanvas();
+};
+
+// 双击画布切换左右镜像翻转，方便前置摄像头用户对齐锚点
+mainForm.custom.onMouseDoubleClick = function(){
+	if(appState.mode == "decoding"){
+		appState.mirrorFlip = !appState.mirrorFlip;
+	}
+};
+
+mainForm.onSize = function(width, height, wParam){
+	layoutCustom();
+	drawCanvas();
+};
+
+mainForm.button1.oncommand = function(id, event){
+	var path = fsys.dlg.open("All files|*.*||", , mainForm.hwnd);
+	if(!path) return;
+	startEncoding(path);
+};
+
+mainForm.button2.oncommand = function(id, event){
+	mainForm.hide();
+	win.delay(300);
+
+	var screenArea = mouse.screenArea();
+	var capturedPath = null;
+
+	screenArea.onBitmapReady = function(bmp){
+		var tempPath = io.tmpname() + ".png";
+		bmp.save(tempPath);
+		bmp.dispose();
+		capturedPath = tempPath;
+		screenArea.endModal(true);
+	};
+
+	screenArea.doModal();
+	mainForm.show();
+
+	if(capturedPath) startEncoding(capturedPath);
+};
+
+mainForm.button3.oncommand = function(id, event){
+	startDecoding();
+};
+
+mainForm.onDropFiles = function(files){
+	if(#files > 0){
+		startEncoding(files[1]);
+	}
+};
+
+mainForm.onClose = function(){
+	stopAll();
+};
+
+layoutCustom();
+drawCanvas();
+
+// 设置窗口缩放范围：最小为初始设计尺寸，最大不超过屏幕工作区
+var mm = win.ui.minmax(mainForm, 650, 753);
+var workArea = win.getWorkArea(mainForm.hwnd);
+if(workArea){
+	mm.argsMax = { x = workArea.width(); y = workArea.height() };
+}
+
+mainForm.show();
+return win.loopMessage();
