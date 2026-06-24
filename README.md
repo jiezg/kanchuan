@@ -4,7 +4,7 @@
 
 将任意文件编码为动态彩色条形码图像序列，通过摄像头实时解码还原文件——实现"看穿屏幕"的文件传输。
 
-![看穿截图](ScreenShot.png)
+<img src="ScreenShot.png" width="480">
 
 ## 功能
 
@@ -21,6 +21,7 @@
 1. **编码**：点击"打开文件"选择文件，或直接拖放文件到窗口。程序自动生成动态图像序列循环播放。
 2. **截图编码**：点击"划区截图"，框选屏幕区域进行编码。
 3. **解码**：点击"图像解码"，启动摄像头。将摄像头对准另一台设备上播放的 cimbar 动态图像，四角锚点变绿表示对齐成功，程序自动解码并保存文件。
+4. **手机解码**：手机端使用 [CFC](https://github.com/sz3/cfc/releases) 扫描解码。将手机摄像头对准电脑屏幕上播放的 cimbar 动态图像即可。
 
 ## 项目结构
 
@@ -32,7 +33,6 @@
 ├── dll/
 │   ├── cimbar_dll.dll   # 核心编解码 DLL（32位，静态链接 OpenCV + Media Foundation）
 │   └── libwinpthread-1.dll  # MinGW 运行时
-├── BUILD_DLL.md         # DLL 编译指南
 ├── libcimbar-0.6.5/     # 原项目源码（含修改）
 ├── res/                 # 资源文件
 └── default.aproj        # aardio 项目文件
@@ -40,7 +40,7 @@
 
 ## 编译
 
-如需重新编译 DLL，请参考 [BUILD_DLL.md](BUILD_DLL.md)。
+如需重新编译 DLL，需安装 MSYS2 MinGW32 工具链和 OpenCV 静态库，参考 `libcimbar-0.6.5/` 中的 CMakeLists.txt。
 
 ## 协议
 
