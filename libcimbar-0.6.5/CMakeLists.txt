@@ -40,6 +40,7 @@ elseif(DEFINED OPENCV_DIR)
 	if(OPENCV_STATIC)
 		file(GLOB OPENCV_LIBS "${OPENCV_DIR}/x64/mingw/staticlib/libopencv_*.a"
 		                      "${OPENCV_DIR}/x64/mingw/staticlib/liblib*.a"
+		                      "${OPENCV_DIR}/x64/mingw/staticlib/libIlmImf.a"
 		                      "${OPENCV_DIR}/x64/mingw/staticlib/libzlib.a")
 	else()
 		file(GLOB OPENCV_LIBS "${OPENCV_DIR}/x64/mingw/bin/*.dll" "${OPENCV_DIR}/x64/mingw/lib/*.dll.a")

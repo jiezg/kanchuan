@@ -24,6 +24,17 @@ extern "C" {
  */
 CIMBAR_API int cimbar_encode_file(const char* filename, int mode_val, int compression);
 
+/* Initialize encoding from a memory buffer.
+ * data: pointer to the data to encode
+ * size: size of the data in bytes
+ * filename: virtual filename for metadata header (can be NULL)
+ * mode_val: encoding mode (4=4C, 66=Bu, 67=Bm, 68=B)
+ * compression: zstd compression level (1-22, 0=disable, default=16)
+ * Returns: 0 on success, negative on error
+ */
+CIMBAR_API int cimbar_encode_buffer(const unsigned char* data, int size,
+                                    const char* filename, int mode_val, int compression);
+
 /* Generate the next encoded frame.
  * Returns: frame number (>0) on success, 0 if no more frames, negative on error
  */

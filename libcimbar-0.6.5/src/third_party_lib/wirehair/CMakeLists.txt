@@ -54,13 +54,14 @@ set(GEN_TABLES
         gf256.h
         )
 
+# 不使用 -march=native，确保兼容不同 CPU
+# 改用 -msse2 -mssse3 显式指定最低指令集（x86 通用支持）
 if(NOT ANDROID AND NOT USE_WASM)
-    set(ARCH_NATIVE "-march=native")
-endif()
-
-if(MSVC)
-else()
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${ARCH_NATIVE}")
+    if(MSVC)
+        # MSVC 默认使用 SSE2，无需额外设置
+    else()
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse2 -mssse3")
+    endif()
 endif()
 
 add_library(wirehair ${LIB_SOURCE_FILES})

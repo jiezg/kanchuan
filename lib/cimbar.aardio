@@ -9,8 +9,17 @@ setDllDirectory(dllDir);
 
 var dll = ..raw.loadDll("~/dll/cimbar_dll.dll",,"cdecl");
 
+// 诊断日志函数，由 main.aardio 通过 setDebugLog 设置
+var _dlog = null;
+setDebugLog = function(fn){
+	_dlog = fn;
+	_dlog("DLL", "cimbar_dll.dll 加载: %s", dll ? "成功" : "失败");
+	_dlog("DLL", "DLL目录: %s", dllDir);
+};
+
 /*编码 API 声明{{*/
 var _encode_file = dll.api("cimbar_encode_file","int(str filename, int mode_val, int compression)");
+var _encode_buffer = dll.api("cimbar_encode_buffer","int(pointer data, int size, str filename, int mode_val, int compression)");
 var _encode_next_frame = dll.api("cimbar_encode_next_frame","int()");
 var _encode_get_frame_width = dll.api("cimbar_encode_get_frame_width","int()");
 var _encode_get_frame_height = dll.api("cimbar_encode_get_frame_height","int()");
@@ -27,10 +36,10 @@ var _decode_configure = dll.api("cimbar_decode_configure","int(int mode_val)");
 var _decode_get_bufsize = dll.api("cimbar_decode_get_bufsize","int()");
 var _decode_scan_extract = dll.api("cimbar_decode_scan_extract","int(pointer imgdata, int imgw, int imgh, int format, pointer bufspace, int bufsize)");
 var _decode_fountain = dll.api("cimbar_decode_fountain","int64(pointer buffer, int size)");
-var _decode_get_filesize = dll.api("cimbar_decode_get_filesize","INT(INT id)");
-var _decode_get_filename = dll.api("cimbar_decode_get_filename","int(INT id, pointer filename, int fnsize)");
+var _decode_get_filesize = dll.api("cimbar_decode_get_filesize","UINT(UINT id)");
+var _decode_get_filename = dll.api("cimbar_decode_get_filename","int(UINT id, pointer filename, int fnsize)");
 var _decode_get_decompress_bufsize = dll.api("cimbar_decode_get_decompress_bufsize","int()");
-var _decode_decompress_read = dll.api("cimbar_decode_decompress_read","int(INT id, pointer buffer, int size)");
+var _decode_decompress_read = dll.api("cimbar_decode_decompress_read","int(UINT id, pointer buffer, int size)");
 var _decode_cleanup = dll.api("cimbar_decode_cleanup","void()");
 var _decode_image = dll.api("cimbar_decode_image","int64(str img_path, int mode_val)");
 var _decode_get_num_streams = dll.api("cimbar_decode_get_num_streams","int()");
@@ -65,23 +74,43 @@ encodeFile = function(filePath, mode, compression){
 	mode := MODE_B;
 	compression := 16;
 
+	if(_dlog) _dlog("DLL", "encodeFile: calling _encode_file(filePath=%s, mode=%d, compression=%d)...", filePath, mode, compression);
 	var ret = _encode_file(filePath, mode, compression);
+	if(_dlog) _dlog("DLL", "encodeFile: ret=%d", ret);
+	if(ret < 0) return false;
+	return true;
+};
+
+// 从内存数据编码，无需写入临时文件
+encodeBuffer = function(data, filename, mode, compression){
+	if(!data) error("参数 @1 数据不能为空",2);
+	mode := MODE_B;
+	compression := 16;
+	filename := "snapshot.png";
+
+	var size = #data;  // 用 # 取 buffer/string 长度，不依赖 raw.sizeof
+	if(_dlog) _dlog("DLL", "encodeBuffer: size=%d, filename=%s, mode=%d, compression=%d", size, filename, mode, compression);
+	var ret = _encode_buffer(data, size, filename, mode, compression);  // buffer 直接传给 pointer 参数，框架自动转换
+	if(_dlog) _dlog("DLL", "encodeBuffer: ret=%d", ret);
 	if(ret < 0) return false;
 	return true;
 };
 
 nextFrameBitmap = function(){
 	var ret = _encode_next_frame();
+	if(_dlog) _dlog("DLL", "nextFrame: _encode_next_frame ret=%d", ret);
 	if(ret <= 0) return null;
 
 	// DLL 端创建 HBITMAP（32位 BGRA DIB Section）
 	var hBitmap = _encode_create_hbitmap();
+	if(_dlog) _dlog("DLL", "nextFrame: hBitmap=%s", hBitmap ? "nonnull" : "null");
 	if(!hBitmap) return null;
 
 	// GdipCreateBitmapFromHBITMAP 会复制像素数据到 GDI+ 内部缓冲区
 	// 创建后 HBITMAP 可立即释放，位图数据由 GDI+ 独立管理
 	var bmp = ..gdip.bitmap(hBitmap);
 	::DeleteObject(hBitmap);
+	if(_dlog) _dlog("DLL", "nextFrame: gdip.bitmap=%s", bmp ? (tostring(bmp.width) + "x" + tostring(bmp.height)) : "null");
 
 	return bmp;
 };
@@ -144,7 +173,7 @@ decodeFrame = function(rgbData, width, height, format){
 	var fileId = _decode_fountain(..raw.toPointer(bufspace), bytesDecoded);
 
 	if(fileId > 0){
-		// 解码完成，返回文件 ID
+		// fileId 实际是 uint32，UINT 参数类型会正确处理无符号转换
 		return { fileId = tonumber(fileId) };
 	}
 	elseif(fileId == 0){
@@ -162,25 +191,39 @@ decodeSave = function(fileId, outputPath){
 
 	// 获取解压缓冲区大小
 	var decompressBufsize = _decode_get_decompress_bufsize();
+	if(_dlog) _dlog("DLL", "decodeSave: fileId=%d, decompressBufsize=%d", fileId, decompressBufsize);
 	if(decompressBufsize <= 0) return false;
 
 	// 获取压缩文件大小，用于估算解压后大小
 	var compressedSize = _decode_get_filesize(fileId);
+	if(_dlog) _dlog("DLL", "decodeSave: compressedSize=%d", compressedSize);
 	if(compressedSize <= 0) return false;
 
 	// 分配足够大的缓冲区（解压后数据通常比压缩数据大）
-	var outSize = math.max(decompressBufsize, compressedSize * 4);
+	var outSize = ..math.max(decompressBufsize, compressedSize * 4);
+	if(_dlog) _dlog("DLL", "decodeSave: outSize=%d", outSize);
 	var outBuffer = ..raw.buffer(outSize);
 
 	var bytesRead = _decode_decompress_read(fileId, ..raw.toPointer(outBuffer), outSize);
+	if(_dlog) _dlog("DLL", "decodeSave: bytesRead=%d", bytesRead);
 	if(bytesRead <= 0) return false;
 
 	..string.save(outputPath, ..raw.tostring(outBuffer, 1, bytesRead));
+	if(_dlog) _dlog("DLL", "decodeSave: saved to %s, %d bytes", outputPath, bytesRead);
 	return true;
 };
 
 decodeCleanup = function(){
 	_decode_cleanup();
+};
+
+decodeGetFilename = function(fileId){
+	if(!fileId) error("参数 @1 文件 ID 不能为空",2);
+	var bufSize = 256;
+	var buf = ..raw.buffer(bufSize);
+	var len = _decode_get_filename(fileId, ..raw.toPointer(buf), bufSize);
+	if(len <= 0) return null;
+	return ..raw.tostring(buf, 1, len);
 };
 
 decodeGetScanResult = function(){
@@ -206,6 +249,7 @@ decodeFrameFromBitmap = function(bmp, format){
 	format := FORMAT_RGB;
 
 	var bmpData = bmp.lockMemory(,0x21808/*_GdipPixelFormat24bppRGB*/,1/*_GdipImageLockModeRead*/,3);
+	if(_dlog) _dlog("DLL", "decodeFrameFromBitmap: lockMemory=%s, size=%dx%d", bmpData ? "OK" : "FAILED", bmpData ? bmpData.width : 0, bmpData ? bmpData.height : 0);
 	if(!bmpData) return null;
 
 	var result = decodeFrame(bmpData.scan0, bmpData.width, bmpData.height, format);
@@ -234,12 +278,14 @@ decodeImage = function(imgPath, mode){
 camOpen = function(index){
 	index := 0;
 	var ret = _cam_open(index);
+	if(_dlog) _dlog("DLL", "camOpen: index=%d, ret=%d", index, ret);
 	if(ret < 0) return false;
 	return true;
 };
 
 camGrabBitmap = function(){
 	var hBitmap = _cam_grab_hbitmap();
+	if(_dlog) _dlog("DLL", "camGrabBitmap: hBitmap=%s", hBitmap ? "nonnull" : "null");
 	if(!hBitmap) return null;
 
 	// GdipCreateBitmapFromHBITMAP 会复制像素数据到 GDI+ 内部缓冲区
@@ -272,6 +318,7 @@ cimbar.FORMAT_RGBA = 像素格式：RGBA(4)
 cimbar.FORMAT_NV12 = 像素格式：YUV_NV12(12)
 cimbar.FORMAT_YUV420P = 像素格式：YUV420p(420)
 cimbar.encodeFile(.(文件路径,编码模式,压缩级别) = 编码文件，准备生成帧序列\n参数 @1 文件路径（必填）\n参数 @2 编码模式，默认 MODE_B\n参数 @3 zstd 压缩级别(0-22)，默认 16\n成功返回 true，失败返回 false
+cimbar.encodeBuffer(.(数据,虚拟文件名,编码模式,压缩级别) = 从内存数据编码，无需写入临时文件\n参数 @1 数据（buffer/string/pointer，必填）\n参数 @2 虚拟文件名（仅作元数据，默认 snapshot.png）\n参数 @3 编码模式，默认 MODE_B\n参数 @4 zstd 压缩级别(0-22)，默认 16\n成功返回 true，失败返回 false
 cimbar.nextFrameBitmap() = 生成下一帧并返回 gdip.bitmap 对象（BGRA 格式）\n无更多帧时返回 null\n需先调用 encodeFile 初始化编码
 cimbar.encodeCleanup() = 清理编码状态，释放资源
 cimbar.getEncodeInfo() = 获取编码信息\n成功返回 {recommended;current;blocksRequired;blocksGenerated}\n失败返回 null

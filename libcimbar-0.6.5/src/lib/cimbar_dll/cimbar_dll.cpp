@@ -24,6 +24,17 @@
 #include <fstream>
 #include <memory>
 #include <sstream>
+#include <cstdio>
+#include <cpuid.h>
+
+/* ===== DLL 诊断日志宏 ===== */
+// 使用 OutputDebugStringA 输出日志，不依赖文件 I/O
+// 可用 DebugView (Sysinternals) 等工具在目标系统上实时查看
+#define DLL_LOG(fmt, ...) do { \
+	char _dll_log_buf[512]; \
+	snprintf(_dll_log_buf, sizeof(_dll_log_buf), "[CIMBAR_DLL] " fmt "\n", ##__VA_ARGS__); \
+	OutputDebugStringA(_dll_log_buf); \
+} while(0)
 
 /* ===== Unicode Path Helper ===== */
 // Windows std::ifstream doesn't support UTF-8 paths.
@@ -80,21 +91,38 @@ namespace decode {
 		if (id != decId)
 		{
 			if (!sink)
+			{
+				DLL_LOG("recover_contents: sink is null");
 				return -1;
+			}
 			if (sink->is_done(id))
+			{
+				DLL_LOG("recover_contents: id=%u is_done=true", id);
 				return -2;
+			}
 
 			reassembled.resize(cimbar_decode_get_filesize(id));
+			DLL_LOG("recover_contents: id=%u, reassembled size=%u", id, (unsigned)reassembled.size());
 			if (!sink->recover(id, reassembled.data(), reassembled.size()))
+			{
+				DLL_LOG("recover_contents: recover failed");
 				return -3;
+			}
 			decId = id;
 
 			int res = init_decompress(id);
 			if (res < 0)
+			{
+				DLL_LOG("recover_contents: init_decompress failed, res=%d", res);
 				return res;
+			}
+			DLL_LOG("recover_contents: success, id=%u", id);
 		}
 		if (reassembled.empty())
+		{
+			DLL_LOG("recover_contents: reassembled is empty");
 			return -5;
+		}
 		return 0;
 	}
 
@@ -143,74 +171,206 @@ extern "C" {
 
 int cimbar_encode_file(const char* filename, int mode_val, int compression)
 {
-	if (!filename || filename[0] == '\0')
-		return -1;
+	DLL_LOG("encode_file ENTER: filename=%s, mode=%d, compression=%d",
+		filename ? filename : "(null)", mode_val, compression);
 
-	// Configure mode
-	cimbar::Config::update(mode_val);
-	encode::modeVal = mode_val;
+	// 输出 CPU 特性信息，便于诊断指令集兼容性问题
+	{
+		unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+		__get_cpuid(1, &eax, &ebx, &ecx, &edx);
+		bool hasSSE2 = (edx & (1 << 26)) != 0;
+		bool hasSSSE3 = (ecx & (1 << 9)) != 0;
+		bool hasAVX2 = false;
+		if (__get_cpuid_max(0, NULL) >= 7) {
+			__get_cpuid(7, &eax, &ebx, &ecx, &edx);
+			hasAVX2 = (ebx & (1 << 5)) != 0;
+		}
+		DLL_LOG("CPU features: SSE2=%d, SSSE3=%d, AVX2=%d", hasSSE2, hasSSSE3, hasAVX2);
+	}
 
-	if (compression < 0 || compression > 22)
-		compression = cimbar::Config::compression_level();
-	encode::compressionLevel = compression;
+	try {
+		if (!filename || filename[0] == '\0')
+			return -1;
 
-	// Initialize fountain codec
-	if (!FountainInit::init())
-		return -5;
+		DLL_LOG("encode_file: Config::update(%d)", mode_val);
+		cimbar::Config::update(mode_val);
+		encode::modeVal = mode_val;
 
-	// Open and compress the file (Unicode path support)
-	std::ifstream ifs = open_file_unicode(filename, std::ios::binary);
-	if (!ifs.is_open())
-		return -2;
+		if (compression < 0 || compression > 22)
+			compression = cimbar::Config::compression_level();
+		encode::compressionLevel = compression;
 
-	auto comp = std::make_unique<cimbar::zstd_compressor<std::stringstream>>();
-	if (!comp)
-		return -3;
+		DLL_LOG("encode_file: FountainInit::init()");
+		if (!FountainInit::init()) {
+			DLL_LOG("encode_file: FountainInit FAILED");
+			return -5;
+		}
 
-	comp->set_compression_level(compression);
+		DLL_LOG("encode_file: opening file");
+		std::ifstream ifs = open_file_unicode(filename, std::ios::binary);
+		if (!ifs.is_open()) {
+			DLL_LOG("encode_file: file open FAILED");
+			return -2;
+		}
 
-	// Write filename header
-	std::string fn = File::basename(filename);
-	if (!fn.empty())
-		comp->write_header(fn.data(), fn.size());
+		DLL_LOG("encode_file: creating compressor");
+		auto comp = std::make_unique<cimbar::zstd_compressor<std::stringstream>>();
+		if (!comp) {
+			DLL_LOG("encode_file: compressor alloc FAILED");
+			return -3;
+		}
 
-	// Compress the file data
-	if (!comp->compress(ifs))
-		return -4;
+		comp->set_compression_level(compression);
 
-	// Pad if necessary
-	unsigned fountainChunkSize = cimbar::Config::fountain_chunk_size();
-	size_t compressedSize = comp->size();
-	if (compressedSize < fountainChunkSize)
-		comp->pad(fountainChunkSize - compressedSize + 1);
+		DLL_LOG("encode_file: writing header");
+		std::string fn = File::basename(filename);
+		if (!fn.empty())
+			comp->write_header(fn.data(), fn.size());
 
-	// Create fountain encoder stream
-	encode::fes = fountain_encoder_stream::create(*comp, fountainChunkSize, encode::encodeId);
-	if (!encode::fes)
-		return -6;
+		DLL_LOG("encode_file: compressing data");
+		if (!comp->compress(ifs)) {
+			DLL_LOG("encode_file: compress FAILED");
+			return -4;
+		}
 
-	encode::nextFrame.reset();
-	encode::frameCount = 0;
-	return 0;
+		unsigned fountainChunkSize = cimbar::Config::fountain_chunk_size();
+		size_t compressedSize = comp->size();
+		if (compressedSize < fountainChunkSize)
+			comp->pad(fountainChunkSize - compressedSize + 1);
+
+		DLL_LOG("encode_file: creating fountain encoder (compressedSize=%zu, chunkSize=%u)",
+			compressedSize, fountainChunkSize);
+		encode::fes = fountain_encoder_stream::create(*comp, fountainChunkSize, encode::encodeId);
+		if (!encode::fes) {
+			DLL_LOG("encode_file: fountain encoder FAILED");
+			return -6;
+		}
+
+		encode::nextFrame.reset();
+		encode::frameCount = 0;
+		DLL_LOG("encode_file: SUCCESS");
+		return 0;
+	}
+	catch (const std::exception& e) {
+		DLL_LOG("encode_file EXCEPTION: %s", e.what());
+		return -99;
+	}
+	catch (...) {
+		DLL_LOG("encode_file UNKNOWN EXCEPTION");
+		return -100;
+	}
+}
+
+int cimbar_encode_buffer(const unsigned char* data, int size,
+                         const char* filename, int mode_val, int compression)
+{
+	DLL_LOG("encode_buffer ENTER: size=%d, filename=%s, mode=%d, compression=%d",
+		size, filename ? filename : "(null)", mode_val, compression);
+
+	try {
+		if (!data || size <= 0)
+			return -1;
+
+		DLL_LOG("encode_buffer: Config::update(%d)", mode_val);
+		cimbar::Config::update(mode_val);
+		encode::modeVal = mode_val;
+
+		if (compression < 0 || compression > 22)
+			compression = cimbar::Config::compression_level();
+		encode::compressionLevel = compression;
+
+		DLL_LOG("encode_buffer: FountainInit::init()");
+		if (!FountainInit::init()) {
+			DLL_LOG("encode_buffer: FountainInit FAILED");
+			return -5;
+		}
+
+		// 从内存构造输入流，避免文件 I/O
+		std::istringstream iss(std::string(reinterpret_cast<const char*>(data), size));
+
+		DLL_LOG("encode_buffer: creating compressor");
+		auto comp = std::make_unique<cimbar::zstd_compressor<std::stringstream>>();
+		if (!comp) {
+			DLL_LOG("encode_buffer: compressor alloc FAILED");
+			return -3;
+		}
+
+		comp->set_compression_level(compression);
+
+		DLL_LOG("encode_buffer: writing header");
+		if (filename && filename[0] != '\0') {
+			std::string fn = File::basename(filename);
+			if (!fn.empty())
+				comp->write_header(fn.data(), fn.size());
+		}
+
+		DLL_LOG("encode_buffer: compressing data");
+		if (!comp->compress(iss)) {
+			DLL_LOG("encode_buffer: compress FAILED");
+			return -4;
+		}
+
+		unsigned fountainChunkSize = cimbar::Config::fountain_chunk_size();
+		size_t compressedSize = comp->size();
+		if (compressedSize < fountainChunkSize)
+			comp->pad(fountainChunkSize - compressedSize + 1);
+
+		DLL_LOG("encode_buffer: creating fountain encoder (compressedSize=%zu, chunkSize=%u)",
+			compressedSize, fountainChunkSize);
+		encode::fes = fountain_encoder_stream::create(*comp, fountainChunkSize, encode::encodeId);
+		if (!encode::fes) {
+			DLL_LOG("encode_buffer: fountain encoder FAILED");
+			return -6;
+		}
+
+		encode::nextFrame.reset();
+		encode::frameCount = 0;
+		DLL_LOG("encode_buffer: SUCCESS");
+		return 0;
+	}
+	catch (const std::exception& e) {
+		DLL_LOG("encode_buffer EXCEPTION: %s", e.what());
+		return -99;
+	}
+	catch (...) {
+		DLL_LOG("encode_buffer UNKNOWN EXCEPTION");
+		return -100;
+	}
 }
 
 int cimbar_encode_next_frame()
 {
-	if (!encode::fes)
-		return -1;
+	DLL_LOG("encode_next_frame ENTER");
+	try {
+		if (!encode::fes) {
+			DLL_LOG("encode_next_frame: no fes");
+			return -1;
+		}
 
-	// Check if we should restart (generate enough blocks for decoder)
-	unsigned required = encode::fes->blocks_required() * 8;
-	if (encode::fes->block_count() > required)
-	{
-		encode::fes->restart();
-		encode::frameCount = 0;
+		unsigned required = encode::fes->blocks_required() * 8;
+		if (encode::fes->block_count() > required)
+		{
+			encode::fes->restart();
+			encode::frameCount = 0;
+		}
+
+		DLL_LOG("encode_next_frame: creating Encoder");
+		Encoder enc;
+		enc.set_encode_id(encode::encodeId);
+
+		DLL_LOG("encode_next_frame: calling encode_next");
+		encode::nextFrame = enc.encode_next(*encode::fes);
+		DLL_LOG("encode_next_frame: encode_next returned, hasFrame=%d", encode::nextFrame.has_value());
+		return ++encode::frameCount;
 	}
-
-	Encoder enc;
-	enc.set_encode_id(encode::encodeId);
-	encode::nextFrame = enc.encode_next(*encode::fes);
-	return ++encode::frameCount;
+	catch (const std::exception& e) {
+		DLL_LOG("encode_next_frame EXCEPTION: %s", e.what());
+		return -99;
+	}
+	catch (...) {
+		DLL_LOG("encode_next_frame UNKNOWN EXCEPTION");
+		return -100;
+	}
 }
 
 int cimbar_encode_get_frame_width()
@@ -310,58 +470,68 @@ int cimbar_encode_copy_frame_bgra(unsigned char* buffer, int bufsize)
 
 void* cimbar_encode_create_hbitmap()
 {
-	if (!encode::nextFrame || encode::nextFrame->cols == 0 || encode::nextFrame->rows == 0)
-		return NULL;
+	try {
+		if (!encode::nextFrame || encode::nextFrame->cols == 0 || encode::nextFrame->rows == 0)
+			return NULL;
 
-	int w = encode::nextFrame->cols;
-	int h = encode::nextFrame->rows;
-	const cv::Mat& frame = *encode::nextFrame;
-	int channels = frame.channels();
+		int w = encode::nextFrame->cols;
+		int h = encode::nextFrame->rows;
+		const cv::Mat& frame = *encode::nextFrame;
+		int channels = frame.channels();
 
-	BITMAPINFO bmi = {};
-	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-	bmi.bmiHeader.biWidth = w;
-	bmi.bmiHeader.biHeight = -h;
-	bmi.bmiHeader.biPlanes = 1;
-	bmi.bmiHeader.biBitCount = 32;
-	bmi.bmiHeader.biCompression = BI_RGB;
+		BITMAPINFO bmi = {};
+		bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+		bmi.bmiHeader.biWidth = w;
+		bmi.bmiHeader.biHeight = -h;
+		bmi.bmiHeader.biPlanes = 1;
+		bmi.bmiHeader.biBitCount = 32;
+		bmi.bmiHeader.biCompression = BI_RGB;
 
-	HDC hdc = GetDC(NULL);
-	void* bits = NULL;
-	HBITMAP hBitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
-	ReleaseDC(NULL, hdc);
+		HDC hdc = GetDC(NULL);
+		void* bits = NULL;
+		HBITMAP hBitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+		ReleaseDC(NULL, hdc);
 
-	if (!hBitmap || !bits)
-		return NULL;
+		if (!hBitmap || !bits)
+			return NULL;
 
-	unsigned char* dst = (unsigned char*)bits;
-	for (int r = 0; r < h; ++r)
-	{
-		const uchar* srcRow = frame.ptr<uchar>(r);
-		unsigned char* dstRow = dst + r * w * 4;
-		if (channels == 3)
+		unsigned char* dst = (unsigned char*)bits;
+		for (int r = 0; r < h; ++r)
 		{
-			for (int c = 0; c < w; ++c)
+			const uchar* srcRow = frame.ptr<uchar>(r);
+			unsigned char* dstRow = dst + r * w * 4;
+			if (channels == 3)
 			{
-				dstRow[c*4+0] = srcRow[c*3+2];
-				dstRow[c*4+1] = srcRow[c*3+1];
-				dstRow[c*4+2] = srcRow[c*3+0];
-				dstRow[c*4+3] = 0xFF;
+				for (int c = 0; c < w; ++c)
+				{
+					dstRow[c*4+0] = srcRow[c*3+2];
+					dstRow[c*4+1] = srcRow[c*3+1];
+					dstRow[c*4+2] = srcRow[c*3+0];
+					dstRow[c*4+3] = 0xFF;
+				}
+			}
+			else if (channels == 4)
+			{
+				for (int c = 0; c < w; ++c)
+				{
+					dstRow[c*4+0] = srcRow[c*4+2];
+					dstRow[c*4+1] = srcRow[c*4+1];
+					dstRow[c*4+2] = srcRow[c*4+0];
+					dstRow[c*4+3] = 0xFF;
+				}
 			}
 		}
-		else if (channels == 4)
-		{
-			for (int c = 0; c < w; ++c)
-			{
-				dstRow[c*4+0] = srcRow[c*4+2];
-				dstRow[c*4+1] = srcRow[c*4+1];
-				dstRow[c*4+2] = srcRow[c*4+0];
-				dstRow[c*4+3] = 0xFF;
-			}
-		}
+
+		return (void*)hBitmap;
 	}
-
-	return (void*)hBitmap;
+	catch (const std::exception& e) {
+		DLL_LOG("encode_create_hbitmap EXCEPTION: %s", e.what());
+		return NULL;
+	}
+	catch (...) {
+		DLL_LOG("encode_create_hbitmap UNKNOWN EXCEPTION");
+		return NULL;
+	}
 }
 
 void cimbar_encode_cleanup()
@@ -373,21 +543,31 @@ void cimbar_encode_cleanup()
 
 int cimbar_encode_get_info(int* recommended, int* current, int* blocks_required, int* blocks_generated)
 {
-	if (!encode::fes)
-		return -1;
+	try {
+		if (!encode::fes)
+			return -1;
 
-	if (recommended) {
-		unsigned chunksPerFrame = cimbar::Config::fountain_chunks_per_frame(cimbar::Config::bits_per_cell());
-		*recommended = (encode::fes->blocks_required() * 4 + chunksPerFrame - 1) / chunksPerFrame;
+		if (recommended) {
+			unsigned chunksPerFrame = cimbar::Config::fountain_chunks_per_frame(cimbar::Config::bits_per_cell());
+			*recommended = (encode::fes->blocks_required() * 4 + chunksPerFrame - 1) / chunksPerFrame;
+		}
+		if (current)
+			*current = encode::frameCount;
+		if (blocks_required)
+			*blocks_required = encode::fes->blocks_required();
+		if (blocks_generated)
+			*blocks_generated = encode::fes->block_count();
+
+		return 0;
 	}
-	if (current)
-		*current = encode::frameCount;
-	if (blocks_required)
-		*blocks_required = encode::fes->blocks_required();
-	if (blocks_generated)
-		*blocks_generated = encode::fes->block_count();
-
-	return 0;
+	catch (const std::exception& e) {
+		DLL_LOG("encode_get_info EXCEPTION: %s", e.what());
+		return -99;
+	}
+	catch (...) {
+		DLL_LOG("encode_get_info UNKNOWN EXCEPTION");
+		return -100;
+	}
 }
 
 /* ===== Decoding API Implementation ===== */
@@ -416,52 +596,75 @@ int cimbar_decode_get_bufsize()
 int cimbar_decode_scan_extract(const unsigned char* imgdata, int imgw, int imgh, int format,
                                unsigned char* bufspace, int bufsize)
 {
-	if (format <= 0)
-		format = 3;
-	if (imgw == 0 || imgh == 0)
-		return -1;
+	DLL_LOG("decode_scan_extract ENTER: %dx%d, format=%d", imgw, imgh, format);
+	try {
+		if (format <= 0)
+			format = 3;
+		if (imgw == 0 || imgh == 0)
+			return -1;
 
-	unsigned chunksPerFrame = decode::fountain_chunks_per_frame();
-	unsigned chunkSize = decode::fountain_chunk_size();
-	if (bufsize < (int)(chunkSize * chunksPerFrame))
-		return -2;
+		unsigned chunksPerFrame = decode::fountain_chunks_per_frame();
+		unsigned chunkSize = decode::fountain_chunk_size();
+		if (bufsize < (int)(chunkSize * chunksPerFrame))
+			return -2;
 
-	escrow_buffer_writer ebw(bufspace, chunksPerFrame, chunkSize);
-	Extractor ext;
-	Decoder dec;
+		escrow_buffer_writer ebw(bufspace, chunksPerFrame, chunkSize);
+		Extractor ext;
+		Decoder dec;
 
-	cv::UMat img = decode::get_rgb((void*)imgdata, imgw, imgh, format);
+		cv::UMat img = decode::get_rgb((void*)imgdata, imgw, imgh, format);
 
-	bool shouldPreprocess = true;
-	{
-		int res = ext.extract(img, img);
-		decode::lastScanResult = res; // 保存扫描结果供 cimbar_decode_get_scan_result 查询
-		if (!res)
-			return -3;
-		else if (res == Extractor::NEEDS_SHARPEN)
-			shouldPreprocess = true;
+		bool shouldPreprocess = true;
+		{
+			int res = ext.extract(img, img);
+			decode::lastScanResult = res;
+			if (!res)
+				return -3;
+			else if (res == Extractor::NEEDS_SHARPEN)
+				shouldPreprocess = true;
+		}
+
+		dec.decode_fountain(img, ebw, shouldPreprocess);
+		int result = ebw.buffers_in_use() * chunkSize;
+		DLL_LOG("decode_scan_extract: result=%d", result);
+		return result;
 	}
-
-	dec.decode_fountain(img, ebw, shouldPreprocess);
-	return ebw.buffers_in_use() * chunkSize;
+	catch (const std::exception& e) {
+		DLL_LOG("decode_scan_extract EXCEPTION: %s", e.what());
+		return -99;
+	}
+	catch (...) {
+		DLL_LOG("decode_scan_extract UNKNOWN EXCEPTION");
+		return -100;
+	}
 }
 
 int64_t cimbar_decode_fountain(const unsigned char* buffer, int size)
 {
-	unsigned chunkSize = decode::fountain_chunk_size();
-	if (!decode::sink)
-		decode::sink = std::make_shared<fountain_decoder_sink>(chunkSize);
+	try {
+		unsigned chunkSize = decode::fountain_chunk_size();
+		if (!decode::sink)
+			decode::sink = std::make_shared<fountain_decoder_sink>(chunkSize);
 
-	if (size == 0 || size % (int)chunkSize != 0)
-		return -5;
+		if (size == 0 || size % (int)chunkSize != 0)
+			return -5;
 
-	int64_t res = 0;
-	for (int i = 0; i < size && res == 0; i += chunkSize)
-	{
-		res = decode::sink->decode_frame(reinterpret_cast<const char*>(buffer + i), chunkSize);
+		int64_t res = 0;
+		for (int i = 0; i < size && res == 0; i += chunkSize)
+		{
+			res = decode::sink->decode_frame(reinterpret_cast<const char*>(buffer + i), chunkSize);
+		}
+
+		return res;
 	}
-
-	return res;
+	catch (const std::exception& e) {
+		DLL_LOG("decode_fountain EXCEPTION: %s", e.what());
+		return -99;
+	}
+	catch (...) {
+		DLL_LOG("decode_fountain UNKNOWN EXCEPTION");
+		return -100;
+	}
 }
 
 unsigned cimbar_decode_get_filesize(uint32_t id)
@@ -500,16 +703,28 @@ int cimbar_decode_decompress_read(uint32_t id, unsigned char* buffer, int size)
 {
 	int res = decode::recover_contents(id);
 	if (res < 0)
+	{
+		DLL_LOG("decompress_read: recover_contents failed, res=%d", res);
 		return res;
+	}
 
 	if (!decode::dec)
+	{
+		DLL_LOG("decompress_read: dec is null");
 		return -13;
+	}
 	if (!decode::dec->good())
+	{
+		DLL_LOG("decompress_read: dec not good");
 		return -14;
+	}
 
 	decode::dec->str(std::string());
-	decode::dec->write_once();
+	// 循环调用 write_once 直到解压完成
+	while (decode::dec->write_once()) {}
 	std::string temp = decode::dec->str();
+	DLL_LOG("decompress_read: decompressed size=%d, buffer size=%d", (int)temp.size(), size);
+
 	if (size > (int)temp.size())
 		size = temp.size();
 	std::copy(temp.data(), temp.data() + size, buffer);
@@ -526,43 +741,54 @@ void cimbar_decode_cleanup()
 
 int64_t cimbar_decode_image(const char* img_path, int mode_val)
 {
-	if (!img_path || img_path[0] == '\0')
-		return -2;
+	DLL_LOG("decode_image ENTER: path=%s, mode=%d", img_path ? img_path : "(null)", mode_val);
+	try {
+		if (!img_path || img_path[0] == '\0')
+			return -2;
 
-	// Configure mode
-	if (mode_val > 0)
-		cimbar_decode_configure(mode_val);
+		// Configure mode
+		if (mode_val > 0)
+			cimbar_decode_configure(mode_val);
 
-	// Read image with Unicode path support
-	std::wstring wpath = utf8_to_wide(img_path);
-	FILE* fp = _wfopen(wpath.c_str(), L"rb");
-	if (!fp) return -2;
+		// Read image with Unicode path support
+		std::wstring wpath = utf8_to_wide(img_path);
+		FILE* fp = _wfopen(wpath.c_str(), L"rb");
+		if (!fp) return -2;
 
-	fseek(fp, 0, SEEK_END);
-	long fileSize = ftell(fp);
-	fseek(fp, 0, SEEK_SET);
-	if (fileSize <= 0) { fclose(fp); return -2; }
+		fseek(fp, 0, SEEK_END);
+		long fileSize = ftell(fp);
+		fseek(fp, 0, SEEK_SET);
+		if (fileSize <= 0) { fclose(fp); return -2; }
 
-	std::vector<uchar> fileBuf(fileSize);
-	fread(fileBuf.data(), 1, fileSize, fp);
-	fclose(fp);
+		std::vector<uchar> fileBuf(fileSize);
+		fread(fileBuf.data(), 1, fileSize, fp);
+		fclose(fp);
 
-	cv::Mat img = cv::imdecode(fileBuf, cv::IMREAD_COLOR);
-	if (img.empty()) return -2;
+		cv::Mat img = cv::imdecode(fileBuf, cv::IMREAD_COLOR);
+		if (img.empty()) return -2;
 
-	// Convert BGR to RGB
-	cv::Mat rgb;
-	cv::cvtColor(img, rgb, cv::COLOR_BGR2RGB);
+		// Convert BGR to RGB
+		cv::Mat rgb;
+		cv::cvtColor(img, rgb, cv::COLOR_BGR2RGB);
 
-	// Scan and extract using existing API
-	int bufsize = cimbar_decode_get_bufsize();
-	std::vector<unsigned char> bufspace(bufsize);
-	int bytesDecoded = cimbar_decode_scan_extract(rgb.data, rgb.cols, rgb.rows, 3, bufspace.data(), bufsize);
-	if (bytesDecoded < 0)
-		return -1; // extract failed
+		// Scan and extract using existing API
+		int bufsize = cimbar_decode_get_bufsize();
+		std::vector<unsigned char> bufspace(bufsize);
+		int bytesDecoded = cimbar_decode_scan_extract(rgb.data, rgb.cols, rgb.rows, 3, bufspace.data(), bufsize);
+		if (bytesDecoded < 0)
+			return -1; // extract failed
 
-	// Fountain decode using existing API
-	return cimbar_decode_fountain(bufspace.data(), bytesDecoded);
+		// Fountain decode using existing API
+		return cimbar_decode_fountain(bufspace.data(), bytesDecoded);
+	}
+	catch (const std::exception& e) {
+		DLL_LOG("decode_image EXCEPTION: %s", e.what());
+		return -99;
+	}
+	catch (...) {
+		DLL_LOG("decode_image UNKNOWN EXCEPTION");
+		return -100;
+	}
 }
 
 int cimbar_decode_get_num_streams()
@@ -614,7 +840,9 @@ namespace camera {
 
 int cimbar_cam_open(int index)
 {
-	if (camera::isOpen) cimbar_cam_close();
+	DLL_LOG("cam_open ENTER: index=%d", index);
+	try {
+		if (camera::isOpen) cimbar_cam_close();
 
 	// 初始化 Media Foundation
 	HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
@@ -718,106 +946,123 @@ int cimbar_cam_open(int index)
 	}
 
 	camera::isOpen = true;
+	DLL_LOG("cam_open: SUCCESS %dx%d", camera::camWidth, camera::camHeight);
 	return 0;
+	}
+	catch (const std::exception& e) {
+		DLL_LOG("cam_open EXCEPTION: %s", e.what());
+		return -99;
+	}
+	catch (...) {
+		DLL_LOG("cam_open UNKNOWN EXCEPTION");
+		return -100;
+	}
 }
 
 void* cimbar_cam_grab_hbitmap()
 {
-	if (!camera::isOpen || !camera::pReader) return NULL;
+	try {
+		if (!camera::isOpen || !camera::pReader) return NULL;
 
-	DWORD streamIndex = 0, flags = 0;
-	LONGLONG timestamp = 0;
-	IMFSample* pSample = nullptr;
+		DWORD streamIndex = 0, flags = 0;
+		LONGLONG timestamp = 0;
+		IMFSample* pSample = nullptr;
 
-	HRESULT hr = camera::pReader->ReadSample(
-		(DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-		0, &streamIndex, &flags, &timestamp, &pSample);
+		HRESULT hr = camera::pReader->ReadSample(
+			(DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+			0, &streamIndex, &flags, &timestamp, &pSample);
 
-	if (FAILED(hr)) return NULL;
-	if (!pSample) return NULL;
-	// 流结束或流中断，跳过
-	if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
+		if (FAILED(hr)) return NULL;
+		if (!pSample) return NULL;
+		// 流结束或流中断，跳过
+		if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
+			pSample->Release();
+			return NULL;
+		}
+
+		// 获取连续缓冲区
+		IMFMediaBuffer* pBuffer = nullptr;
+		hr = pSample->ConvertToContiguousBuffer(&pBuffer);
 		pSample->Release();
-		return NULL;
-	}
 
-	// 获取连续缓冲区
-	IMFMediaBuffer* pBuffer = nullptr;
-	hr = pSample->ConvertToContiguousBuffer(&pBuffer);
-	pSample->Release();
+		if (FAILED(hr) || !pBuffer) return NULL;
 
-	if (FAILED(hr) || !pBuffer) return NULL;
+		BYTE* pData = nullptr;
+		DWORD bufLen = 0;
+		hr = pBuffer->Lock(&pData, nullptr, &bufLen);
+		if (FAILED(hr)) { pBuffer->Release(); return NULL; }
 
-	BYTE* pData = nullptr;
-	DWORD bufLen = 0;
-	hr = pBuffer->Lock(&pData, nullptr, &bufLen);
-	if (FAILED(hr)) { pBuffer->Release(); return NULL; }
+		int w = camera::camWidth;
+		int h = camera::camHeight;
+		if (w <= 0 || h <= 0) {
+			pBuffer->Unlock(); pBuffer->Release();
+			return NULL;
+		}
 
-	int w = camera::camWidth;
-	int h = camera::camHeight;
-	if (w <= 0 || h <= 0) {
-		pBuffer->Unlock(); pBuffer->Release();
-		return NULL;
-	}
+		// 获取帧步幅（每行字节数，可能大于 w*4）
+		LONG stride = 0;
+		IMFMediaType* pType = nullptr;
+		hr = camera::pReader->GetCurrentMediaType(
+			(DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &pType);
+		if (SUCCEEDED(hr)) {
+			UINT32 uStride = 0;
+			if (SUCCEEDED(pType->GetUINT32(MF_MT_DEFAULT_STRIDE, &uStride)))
+				stride = (LONG)uStride;
+			pType->Release();
+		}
+		if (stride == 0) stride = w * 4;
 
-	// 获取帧步幅（每行字节数，可能大于 w*4）
-	LONG stride = 0;
-	IMFMediaType* pType = nullptr;
-	hr = camera::pReader->GetCurrentMediaType(
-		(DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &pType);
-	if (SUCCEEDED(hr)) {
-		// MF_MT_DEFAULT_STRIDE 属性可能不存在，用 GetUINT32 安全获取
-		UINT32 uStride = 0;
-		if (SUCCEEDED(pType->GetUINT32(MF_MT_DEFAULT_STRIDE, &uStride)))
-			stride = (LONG)uStride;
-		pType->Release();
-	}
-	if (stride == 0) stride = w * 4;
+		// 创建 32 位 BGRA HBITMAP（与编码帧格式一致）
+		BITMAPINFO bmi = {};
+		bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+		bmi.bmiHeader.biWidth = w;
+		bmi.bmiHeader.biHeight = -h; // 自顶向下
+		bmi.bmiHeader.biPlanes = 1;
+		bmi.bmiHeader.biBitCount = 32;
+		bmi.bmiHeader.biCompression = BI_RGB;
 
-	// 创建 32 位 BGRA HBITMAP（与编码帧格式一致）
-	BITMAPINFO bmi = {};
-	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-	bmi.bmiHeader.biWidth = w;
-	bmi.bmiHeader.biHeight = -h; // 自顶向下
-	bmi.bmiHeader.biPlanes = 1;
-	bmi.bmiHeader.biBitCount = 32;
-	bmi.bmiHeader.biCompression = BI_RGB;
+		HDC hdc = GetDC(NULL);
+		void* bits = NULL;
+		HBITMAP hBitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+		ReleaseDC(NULL, hdc);
 
-	HDC hdc = GetDC(NULL);
-	void* bits = NULL;
-	HBITMAP hBitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
-	ReleaseDC(NULL, hdc);
+		if (hBitmap && bits) {
+			unsigned char* dst = (unsigned char*)bits;
+			unsigned char* src = (unsigned char*)pData;
+			int dstStride = w * 4;
 
-	if (hBitmap && bits) {
-		unsigned char* dst = (unsigned char*)bits;
-		unsigned char* src = (unsigned char*)pData;
-		int dstStride = w * 4;
-
-		if (stride < 0) {
-			// 底向上图像，需要翻转行序
-			src = src + (h - 1) * (-stride);
-			for (int r = 0; r < h; ++r) {
-				memcpy(dst + r * dstStride, src - r * (-stride), dstStride);
+			if (stride < 0) {
+				src = src + (h - 1) * (-stride);
+				for (int r = 0; r < h; ++r) {
+					memcpy(dst + r * dstStride, src - r * (-stride), dstStride);
+				}
+			} else if (stride == dstStride) {
+				memcpy(dst, src, dstStride * h);
+			} else {
+				for (int r = 0; r < h; ++r) {
+					memcpy(dst + r * dstStride, src + r * stride, dstStride);
+				}
 			}
-		} else if (stride == dstStride) {
-			memcpy(dst, src, dstStride * h);
-		} else {
-			// 步幅大于宽度，逐行复制
-			for (int r = 0; r < h; ++r) {
-				memcpy(dst + r * dstStride, src + r * stride, dstStride);
+
+			// MF RGB32 的 Alpha 通道可能为 0，设为 0xFF 以兼容 GDI+
+			for (int i = 0; i < w * h; ++i) {
+				dst[i * 4 + 3] = 0xFF;
 			}
 		}
 
-		// MF RGB32 的 Alpha 通道可能为 0，设为 0xFF 以兼容 GDI+
-		for (int i = 0; i < w * h; ++i) {
-			dst[i * 4 + 3] = 0xFF;
-		}
+		pBuffer->Unlock();
+		pBuffer->Release();
+
+		return (void*)hBitmap;
 	}
-
-	pBuffer->Unlock();
-	pBuffer->Release();
-
-	return (void*)hBitmap;
+	catch (const std::exception& e) {
+		DLL_LOG("cam_grab_hbitmap EXCEPTION: %s", e.what());
+		return NULL;
+	}
+	catch (...) {
+		DLL_LOG("cam_grab_hbitmap UNKNOWN EXCEPTION");
+		return NULL;
+	}
 }
 
 void cimbar_cam_close()

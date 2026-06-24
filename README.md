@@ -4,6 +4,8 @@
 
 将任意文件编码为动态彩色条形码图像序列，通过摄像头实时解码还原文件——实现"看穿屏幕"的文件传输。
 
+![看穿截图](ScreenShot.png)
+
 ## 功能
 
 - **文件编码**：将文件编码为 cimbar 动态图像序列，循环播放
@@ -30,10 +32,7 @@
 ├── dll/
 │   ├── cimbar_dll.dll   # 核心编解码 DLL（32位，静态链接 OpenCV + Media Foundation）
 │   └── libwinpthread-1.dll  # MinGW 运行时
-├── build/
-│   ├── cimbar_dll.cpp   # DLL 源码（含摄像头捕获、HBITMAP 输出等修改）
-│   ├── cimbar_dll.h     # DLL 头文件
-│   └── rebuild_dll.bat  # 编译脚本
+├── BUILD_DLL.md         # DLL 编译指南
 ├── libcimbar-0.6.5/     # 原项目源码（含修改）
 ├── res/                 # 资源文件
 └── default.aproj        # aardio 项目文件
@@ -41,13 +40,7 @@
 
 ## 编译
 
-如需重新编译 DLL，需要：
-
-1. 安装 [MSYS2 MinGW32](https://www.msys2.org/) 工具链
-2. 编译 OpenCV 静态库（core/imgproc/imgcodecs/calib3d/photo/features2d/flann 模块）
-3. 参考 `build/rebuild_dll.bat` 执行编译
-
-> 注意：MinGW 编译器不支持含中文的路径，需使用符号链接或英文路径。
+如需重新编译 DLL，请参考 [BUILD_DLL.md](BUILD_DLL.md)。
 
 ## 协议
 
