@@ -20,6 +20,7 @@ setDebugLog = function(fn){
 /*编码 API 声明{{*/
 var _encode_file = dll.api("cimbar_encode_file","int(str filename, int mode_val, int compression)");
 var _encode_buffer = dll.api("cimbar_encode_buffer","int(pointer data, int size, str filename, int mode_val, int compression)");
+var _encode_buffer_ex = dll.api("cimbar_encode_buffer_ex","int(pointer data, int size, str filename, int mode_val, int compression, int encode_id)");
 var _encode_next_frame = dll.api("cimbar_encode_next_frame","int()");
 var _encode_get_frame_width = dll.api("cimbar_encode_get_frame_width","int()");
 var _encode_get_frame_height = dll.api("cimbar_encode_get_frame_height","int()");
@@ -29,6 +30,8 @@ var _encode_copy_frame_bgra = dll.api("cimbar_encode_copy_frame_bgra","int(point
 var _encode_get_info = dll.api("cimbar_encode_get_info","int(int & recommended, int & current, int & blocks_required, int & blocks_generated)");
 var _encode_create_hbitmap = dll.api("cimbar_encode_create_hbitmap","pointer()");
 var _encode_cleanup = dll.api("cimbar_encode_cleanup","void()");
+var _encode_save_stream = dll.api("cimbar_encode_save_stream","int(int encode_id)");
+var _encode_restore_stream = dll.api("cimbar_encode_restore_stream","int(int encode_id)");
 /*}}*/
 
 /*解码 API 声明{{*/
@@ -96,6 +99,23 @@ encodeBuffer = function(data, filename, mode, compression){
 	return true;
 };
 
+// 从内存数据编码，支持指定 encode_id（大文件分块传输）
+// encode_id: 0-127，-1 表示使用内部默认值
+encodeBufferEx = function(data, filename, mode, compression, encodeId){
+	if(!data) error("参数 @1 数据不能为空",2);
+	mode := MODE_B;
+	compression := 16;
+	filename := "snapshot.png";
+	encodeId := -1;
+
+	var size = #data;
+	if(_dlog) _dlog("DLL", "encodeBufferEx: size=%d, filename=%s, mode=%d, compression=%d, encodeId=%d", size, filename, mode, compression, encodeId);
+	var ret = _encode_buffer_ex(data, size, filename, mode, compression, encodeId);
+	if(_dlog) _dlog("DLL", "encodeBufferEx: ret=%d", ret);
+	if(ret < 0) return false;
+	return true;
+};
+
 nextFrameBitmap = function(){
 	var ret = _encode_next_frame();
 	if(_dlog) _dlog("DLL", "nextFrame: _encode_next_frame ret=%d", ret);
@@ -117,6 +137,18 @@ nextFrameBitmap = function(){
 
 encodeCleanup = function(){
 	_encode_cleanup();
+};
+
+// 保存当前 encoder stream 到缓存（大文件分块切换时使用）
+encodeSaveStream = function(encodeId){
+	if(_dlog) _dlog("DLL", "encodeSaveStream: encodeId=%d", encodeId);
+	return _encode_save_stream(encodeId);
+};
+
+// 从缓存恢复 encoder stream（返回 0=恢复成功, 1=缓存未命中, 负数=错误）
+encodeRestoreStream = function(encodeId){
+	if(_dlog) _dlog("DLL", "encodeRestoreStream: encodeId=%d", encodeId);
+	return _encode_restore_stream(encodeId);
 };
 
 getEncodeInfo = function(){
@@ -185,7 +217,7 @@ decodeFrame = function(rgbData, width, height, format){
 	return null;
 };
 
-decodeSave = function(fileId, outputPath){
+decodeSave = function(fileId, outputPath, expectedSize){
 	if(!fileId) error("参数 @1 文件 ID 不能为空",2);
 	if(!outputPath) error("参数 @2 输出路径不能为空",2);
 
@@ -199,9 +231,21 @@ decodeSave = function(fileId, outputPath){
 	if(_dlog) _dlog("DLL", "decodeSave: compressedSize=%d", compressedSize);
 	if(compressedSize <= 0) return false;
 
-	// 分配足够大的缓冲区（解压后数据通常比压缩数据大）
-	var outSize = ..math.max(decompressBufsize, compressedSize * 4);
-	if(_dlog) _dlog("DLL", "decodeSave: outSize=%d", outSize);
+	// 分配解压缓冲区：
+	// - 优先使用 expectedSize（调用方从 manifest.chunk_size 传入，精确匹配解压后大小）
+	// - 否则用 compressedSize * 4 估算（移除 4MB 上限，防止大 chunk 数据截断）
+	// 注意：DLL 端 cimbar_decode_decompress_read 一次性解压全部数据到内存，
+	//       只返回 min(size, temp.size()) 字节，剩余数据丢失（_inBuff 已耗尽）。
+	//       因此 outSize 必须 >= 解压后大小，否则数据被截断。
+	var outSize;
+	if(expectedSize && expectedSize > 0){
+		// 精确模式：用 manifest.chunk_size + 1KB 余量
+		outSize = ..math.max(decompressBufsize, expectedSize + 1024);
+	} else {
+		// 估算模式：压缩后大小 * 4（无上限）
+		outSize = ..math.max(decompressBufsize, compressedSize * 4);
+	}
+	if(_dlog) _dlog("DLL", "decodeSave: outSize=%d, expectedSize=%d", outSize, expectedSize ? expectedSize : -1);
 	var outBuffer = ..raw.buffer(outSize);
 
 	var bytesRead = _decode_decompress_read(fileId, ..raw.toPointer(outBuffer), outSize);
@@ -242,6 +286,21 @@ getDecodeProgress = function(){
 	}
 
 	return maxProgress;
+};
+
+// 获取解码 stream 详细信息（大文件多 stream 场景）
+getDecodeReport = function(){
+	var numStreams = _decode_get_num_streams();
+	var numDone = _decode_get_num_done();
+	var progressList = {};
+	for(i=0;numStreams-1){
+		..table.push(progressList, _decode_get_stream_progress(i));
+	}
+	return {
+		numStreams = numStreams;
+		numDone = numDone;
+		progress = progressList;
+	};
 };
 
 decodeFrameFromBitmap = function(bmp, format){
@@ -319,6 +378,7 @@ cimbar.FORMAT_NV12 = 像素格式：YUV_NV12(12)
 cimbar.FORMAT_YUV420P = 像素格式：YUV420p(420)
 cimbar.encodeFile(.(文件路径,编码模式,压缩级别) = 编码文件，准备生成帧序列\n参数 @1 文件路径（必填）\n参数 @2 编码模式，默认 MODE_B\n参数 @3 zstd 压缩级别(0-22)，默认 16\n成功返回 true，失败返回 false
 cimbar.encodeBuffer(.(数据,虚拟文件名,编码模式,压缩级别) = 从内存数据编码，无需写入临时文件\n参数 @1 数据（buffer/string/pointer，必填）\n参数 @2 虚拟文件名（仅作元数据，默认 snapshot.png）\n参数 @3 编码模式，默认 MODE_B\n参数 @4 zstd 压缩级别(0-22)，默认 16\n成功返回 true，失败返回 false
+cimbar.encodeBufferEx(.(数据,虚拟文件名,编码模式,压缩级别,encode_id) = 从内存数据编码，支持指定 encode_id（大文件分块传输）\n参数 @1 数据（buffer/string/pointer，必填）\n参数 @2 虚拟文件名\n参数 @3 编码模式，默认 MODE_B\n参数 @4 zstd 压缩级别，默认 16\n参数 @5 encode_id(0-127)，-1=默认\n成功返回 true，失败返回 false
 cimbar.nextFrameBitmap() = 生成下一帧并返回 gdip.bitmap 对象（BGRA 格式）\n无更多帧时返回 null\n需先调用 encodeFile 初始化编码
 cimbar.encodeCleanup() = 清理编码状态，释放资源
 cimbar.getEncodeInfo() = 获取编码信息\n成功返回 {recommended;current;blocksRequired;blocksGenerated}\n失败返回 null
@@ -328,5 +388,6 @@ cimbar.decodeFrameFromBitmap(.(gdip.bitmap对象,像素格式) = 从 gdip.bitmap
 cimbar.decodeSave(.(文件ID,输出路径) = 保存解码文件\n参数 @1 解码返回的 fileId\n参数 @2 输出文件路径\n成功返回 true，失败返回 false
 cimbar.decodeCleanup() = 清理解码状态，释放资源
 cimbar.getDecodeProgress() = 获取解码进度(0-100)\n返回所有流中的最大进度值
+cimbar.getDecodeReport() = 获取解码 stream 详细信息\n返回 {numStreams;numDone;progress={...}}\n大文件多 stream 场景使用
 cimbar.decodeImage(.(图像路径,编码模式) = 一步解码图像文件\n参数 @1 图像文件路径\n参数 @2 编码模式，0=自动检测\n解码完成返回 {fileId=数字}\n需要更多帧返回 {bytesDecoded=0}\n失败返回 null
 end intellisense**/

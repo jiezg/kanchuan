@@ -189,7 +189,10 @@ public:
 
 		fountain_decoder_stream& s = p->second;
 		bool res = s.recover(data, size);
-		mark_done(md, get_filename(md));
+		// 仅在恢复成功时标记完成并移除 stream
+		// 如果恢复失败，保留 stream 以便后续帧继续解码
+		if (res)
+			mark_done(md, get_filename(md));
 		return res;
 	}
 

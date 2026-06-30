@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <unordered_map>
 #include <sstream>
 #include <cstdio>
 #include <cpuid.h>
@@ -62,6 +63,9 @@ namespace encode {
 	int frameCount = 0;
 	int modeVal = 68;
 	int compressionLevel = cimbar::Config::compression_level();
+	// encoder stream 缓存：大文件模式切换 chunk 时保存/恢复 stream，
+	// 避免重建 encoder 产生重复 fountain block 导致解码端无法完成
+	std::unordered_map<uint8_t, std::shared_ptr<fountain_encoder_stream>> streamCache;
 }
 
 /* ===== Decoding State ===== */
@@ -105,7 +109,8 @@ namespace decode {
 			DLL_LOG("recover_contents: id=%u, reassembled size=%u", id, (unsigned)reassembled.size());
 			if (!sink->recover(id, reassembled.data(), reassembled.size()))
 			{
-				DLL_LOG("recover_contents: recover failed");
+				DLL_LOG("recover_contents: recover FAILED, id=%u, reassembled_size=%u, num_streams=%u, num_done=%u",
+					id, (unsigned)reassembled.size(), sink->num_streams(), sink->num_done());
 				return -3;
 			}
 			decId = id;
@@ -264,14 +269,22 @@ int cimbar_encode_file(const char* filename, int mode_val, int compression)
 int cimbar_encode_buffer(const unsigned char* data, int size,
                          const char* filename, int mode_val, int compression)
 {
-	DLL_LOG("encode_buffer ENTER: size=%d, filename=%s, mode=%d, compression=%d",
-		size, filename ? filename : "(null)", mode_val, compression);
+	// 向后兼容：不指定 encode_id，使用内部默认值
+	return cimbar_encode_buffer_ex(data, size, filename, mode_val, compression, -1);
+}
+
+int cimbar_encode_buffer_ex(const unsigned char* data, int size,
+                            const char* filename, int mode_val, int compression,
+                            int encode_id)
+{
+	DLL_LOG("encode_buffer_ex ENTER: size=%d, filename=%s, mode=%d, compression=%d, encode_id=%d",
+		size, filename ? filename : "(null)", mode_val, compression, encode_id);
 
 	try {
 		if (!data || size <= 0)
 			return -1;
 
-		DLL_LOG("encode_buffer: Config::update(%d)", mode_val);
+		DLL_LOG("encode_buffer_ex: Config::update(%d)", mode_val);
 		cimbar::Config::update(mode_val);
 		encode::modeVal = mode_val;
 
@@ -279,34 +292,38 @@ int cimbar_encode_buffer(const unsigned char* data, int size,
 			compression = cimbar::Config::compression_level();
 		encode::compressionLevel = compression;
 
-		DLL_LOG("encode_buffer: FountainInit::init()");
+		// 设置 encode_id：-1 使用内部默认值，否则取低 7 位（wirehair 限制 0-127）
+		if (encode_id >= 0)
+			encode::encodeId = (uint8_t)(encode_id & 0x7F);
+
+		DLL_LOG("encode_buffer_ex: FountainInit::init()");
 		if (!FountainInit::init()) {
-			DLL_LOG("encode_buffer: FountainInit FAILED");
+			DLL_LOG("encode_buffer_ex: FountainInit FAILED");
 			return -5;
 		}
 
 		// 从内存构造输入流，避免文件 I/O
 		std::istringstream iss(std::string(reinterpret_cast<const char*>(data), size));
 
-		DLL_LOG("encode_buffer: creating compressor");
+		DLL_LOG("encode_buffer_ex: creating compressor");
 		auto comp = std::make_unique<cimbar::zstd_compressor<std::stringstream>>();
 		if (!comp) {
-			DLL_LOG("encode_buffer: compressor alloc FAILED");
+			DLL_LOG("encode_buffer_ex: compressor alloc FAILED");
 			return -3;
 		}
 
 		comp->set_compression_level(compression);
 
-		DLL_LOG("encode_buffer: writing header");
+		DLL_LOG("encode_buffer_ex: writing header");
 		if (filename && filename[0] != '\0') {
 			std::string fn = File::basename(filename);
 			if (!fn.empty())
 				comp->write_header(fn.data(), fn.size());
 		}
 
-		DLL_LOG("encode_buffer: compressing data");
+		DLL_LOG("encode_buffer_ex: compressing data");
 		if (!comp->compress(iss)) {
-			DLL_LOG("encode_buffer: compress FAILED");
+			DLL_LOG("encode_buffer_ex: compress FAILED");
 			return -4;
 		}
 
@@ -315,25 +332,25 @@ int cimbar_encode_buffer(const unsigned char* data, int size,
 		if (compressedSize < fountainChunkSize)
 			comp->pad(fountainChunkSize - compressedSize + 1);
 
-		DLL_LOG("encode_buffer: creating fountain encoder (compressedSize=%zu, chunkSize=%u)",
-			compressedSize, fountainChunkSize);
+		DLL_LOG("encode_buffer_ex: creating fountain encoder (compressedSize=%zu, chunkSize=%u, encodeId=%d)",
+			compressedSize, fountainChunkSize, encode::encodeId);
 		encode::fes = fountain_encoder_stream::create(*comp, fountainChunkSize, encode::encodeId);
 		if (!encode::fes) {
-			DLL_LOG("encode_buffer: fountain encoder FAILED");
+			DLL_LOG("encode_buffer_ex: fountain encoder FAILED");
 			return -6;
 		}
 
 		encode::nextFrame.reset();
 		encode::frameCount = 0;
-		DLL_LOG("encode_buffer: SUCCESS");
+		DLL_LOG("encode_buffer_ex: SUCCESS");
 		return 0;
 	}
 	catch (const std::exception& e) {
-		DLL_LOG("encode_buffer EXCEPTION: %s", e.what());
+		DLL_LOG("encode_buffer_ex EXCEPTION: %s", e.what());
 		return -99;
 	}
 	catch (...) {
-		DLL_LOG("encode_buffer UNKNOWN EXCEPTION");
+		DLL_LOG("encode_buffer_ex UNKNOWN EXCEPTION");
 		return -100;
 	}
 }
@@ -539,6 +556,44 @@ void cimbar_encode_cleanup()
 	encode::fes.reset();
 	encode::nextFrame.reset();
 	encode::frameCount = 0;
+	encode::streamCache.clear();
+}
+
+/* 保存当前 encoder stream 到缓存（按 encode_id 索引）
+ * 大文件分块编码：切换到其他 chunk 前调用，保留 block 位置
+ * encode_id: fountain stream ID (0-127)
+ * Returns: 0 on success, negative on error
+ */
+CIMBAR_API int cimbar_encode_save_stream(int encode_id)
+{
+	if (!encode::fes)
+		return -1;
+	uint8_t eid = (uint8_t)(encode_id & 0x7F);
+	encode::streamCache[eid] = encode::fes;
+	DLL_LOG("encode_save_stream: saved encode_id=%d, block_count=%u, cache_size=%u",
+		eid, encode::fes->block_count(), (unsigned)encode::streamCache.size());
+	return 0;
+}
+
+/* 从缓存恢复 encoder stream（按 encode_id 索引）
+ * 切换回之前保存的 chunk 时调用，从中断处继续编码
+ * encode_id: fountain stream ID (0-127)
+ * Returns: 0 on success (stream restored), 1 if not found in cache, negative on error
+ */
+CIMBAR_API int cimbar_encode_restore_stream(int encode_id)
+{
+	uint8_t eid = (uint8_t)(encode_id & 0x7F);
+	auto it = encode::streamCache.find(eid);
+	if (it == encode::streamCache.end())
+		return 1;  // 缓存中没有，需要重建
+	encode::fes = it->second;
+	encode::nextFrame.reset();
+	encode::frameCount = 0;
+	// 从当前 block 位置继续，需要 restart 让 encoder 重新开始当前轮
+	encode::fes->restart();
+	DLL_LOG("encode_restore_stream: restored encode_id=%d, block_count=%u",
+		eid, encode::fes->block_count());
+	return 0;
 }
 
 int cimbar_encode_get_info(int* recommended, int* current, int* blocks_required, int* blocks_generated)
@@ -654,6 +709,13 @@ int64_t cimbar_decode_fountain(const unsigned char* buffer, int size)
 		{
 			res = decode::sink->decode_frame(reinterpret_cast<const char*>(buffer + i), chunkSize);
 		}
+
+		// 当 stream 完成时记录详细信息，便于追踪解码流程
+		if (res > 0)
+			DLL_LOG("decode_fountain: stream COMPLETED, id=%lld, num_streams=%u, num_done=%u",
+				(long long)res, decode::sink->num_streams(), decode::sink->num_done());
+		else if (res < 0 && res != -1) // -1 是正常的 is_done 跳过，不记录
+			DLL_LOG("decode_fountain: decode_frame error=%lld", (long long)res);
 
 		return res;
 	}

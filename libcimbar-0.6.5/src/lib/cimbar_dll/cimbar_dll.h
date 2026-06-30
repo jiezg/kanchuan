@@ -35,6 +35,20 @@ CIMBAR_API int cimbar_encode_file(const char* filename, int mode_val, int compre
 CIMBAR_API int cimbar_encode_buffer(const unsigned char* data, int size,
                                     const char* filename, int mode_val, int compression);
 
+/* Initialize encoding from a memory buffer with explicit encode_id.
+ * 大文件分块传输：每个 chunk 使用不同 encode_id，解码端自动分桶。
+ * data: pointer to the data to encode
+ * size: size of the data in bytes
+ * filename: virtual filename for metadata header (can be NULL)
+ * mode_val: encoding mode (4=4C, 66=Bu, 67=Bm, 68=B)
+ * compression: zstd compression level (1-22, 0=disable, default=16)
+ * encode_id: fountain stream ID (0-127). -1 = use internal default.
+ * Returns: 0 on success, negative on error
+ */
+CIMBAR_API int cimbar_encode_buffer_ex(const unsigned char* data, int size,
+                                       const char* filename, int mode_val, int compression,
+                                       int encode_id);
+
 /* Generate the next encoded frame.
  * Returns: frame number (>0) on success, 0 if no more frames, negative on error
  */
@@ -89,6 +103,20 @@ CIMBAR_API void* cimbar_encode_create_hbitmap();
 
 /* Cleanup encoding state and release resources. */
 CIMBAR_API void cimbar_encode_cleanup();
+
+/* Save the current encoder stream to cache (indexed by encode_id).
+ * Call before switching to another chunk in big file mode.
+ * encode_id: fountain stream ID (0-127)
+ * Returns: 0 on success, negative on error
+ */
+CIMBAR_API int cimbar_encode_save_stream(int encode_id);
+
+/* Restore an encoder stream from cache (indexed by encode_id).
+ * Call when switching back to a previously saved chunk.
+ * encode_id: fountain stream ID (0-127)
+ * Returns: 0 on success (stream restored), 1 if not in cache, negative on error
+ */
+CIMBAR_API int cimbar_encode_restore_stream(int encode_id);
 
 /* ===== Decoding API ===== */
 

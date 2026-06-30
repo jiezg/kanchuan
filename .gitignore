@@ -6,6 +6,5 @@
 dist/
 
 # 构建相关（不同步到仓库）
-BUILD_DLL.md
 build/
 

@@ -72,7 +72,8 @@ public:
 
 	unsigned blocks_required() const
 	{
-		return (_data.size() / block_size()) + 1;
+		// 向上取整：等价于 ceil(data_size / block_size)
+		return (_data.size() + block_size() - 1) / block_size();
 	}
 
 	void encode_new_block()

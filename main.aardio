@@ -6,13 +6,20 @@ import fsys.dlg;
 import fsys.log;
 import mouse.screenArea;
 import gdip.snap;
+import web.json;
+import crypt;
+
+// 获取系统启动后的毫秒数（用于测试模式计时）
+var getTickMs = ..raw.loadDll("kernel32.dll").api("GetTickCount","int()");
 
 // 诊断日志：仅 --debug 参数启动时生效，正常运行无任何开销
 var debugLog = null;
 dlog = function(tag, fmt, ...){
 	if(!debugLog) return;
 	var ts = time().format("%Y-%m-%d %H:%M:%S");
-	if(...) debugLog.printf("[%s] [%s] " + fmt, ts, tag, ...);
+	// 用 string.format 格式化消息，再传给 print
+	// 直接用 fsys.log.printf 时 ... 展开参数无法正确传递，导致 %d/%s 不替换
+	if(...) debugLog.print(..string.format("[%s] [%s] " + fmt, ts, tag, ...));
 	else debugLog.print("[" + ts + "] [" + tag + "] " + fmt);
 };
 
@@ -25,23 +32,26 @@ if(_ARGV && _ARGV.debug){
 	}
 	debugLog = fsys.log(logPath);
 	dlog("INIT", "=== 看穿 v0.9.9 诊断日志启动 ===");
-	dlog("INIT", "命令行参数: %s", ..util.table.tostring(_ARGV));
+	// 用 web.json.stringify 替代 util.table.tostring（避免未 import 的库）
+	dlog("INIT", "命令行参数: %s", ..web.json.stringify(_ARGV, true));
 	dlog("INIT", "EXE路径: %s", io._exepath);
 	cimbar.setDebugLog(dlog); // 将日志函数传递给 cimbar 模块
 }
 /*DSG{{*/
 mainForm = win.form(text="看穿";right=649;bottom=753;acceptfiles=1)
 mainForm.add(
-button1={cls="button";text="打开文件";left=28;top=29;right=148;bottom=59;dl=1;dt=1;z=1};
-button2={cls="button";text="划区截图";left=165;top=29;right=285;bottom=59;dl=1;dt=1;z=2};
-button3={cls="button";text="图像解码";left=332;top=29;right=452;bottom=59;dr=1;dt=1;z=3};
-combobox={cls="combobox";left=500;top=32;right=620;bottom=58;dr=1;dt=1;edge=1;items={};mode="dropdown";z=6};
-custom={cls="custom";text="画布";left=25;top=128;right=625;bottom=728;z=4};
-groupbox={cls="groupbox";text="编码";left=13;top=6;right=302;bottom=68;dl=1;dt=1;edge=1;z=8};
-groupbox2={cls="groupbox";text="解码";left=316;top=6;right=468;bottom=68;dr=1;dt=1;edge=1;z=9};
-groupbox3={cls="groupbox";text="模式";left=484;top=6;right=636;bottom=68;dr=1;dt=1;edge=1;z=10};
-progress={cls="progress";left=25;top=106;right=625;bottom=116;dl=1;dr=1;dt=1;edge=1;max=100;min=0;z=7};
-static={cls="static";text="试试拖放一个小文件!";left=25;top=74;right=625;bottom=101;dl=1;dr=1;dt=1;transparent=1;z=5}
+button={cls="button";text='\u2699';left=602;top=29;right=627;bottom=59;dr=1;dt=1;z=7};
+button1={cls="button";text="打开文件";left=28;top=29;right=148;bottom=59;dl=1;dt=1;z=4};
+button2={cls="button";text="划区截图";left=165;top=29;right=285;bottom=59;dl=1;dt=1;z=5};
+button3={cls="button";text="图像解码";left=332;top=29;right=452;bottom=59;dr=1;dt=1;z=6};
+combobox={cls="combobox";left=500;top=33;right=600;bottom=59;dr=1;dt=1;edge=1;items={};mode="dropdownlist";z=8};
+custom={cls="custom";text="画布";left=25;top=128;right=625;bottom=728;z=9};
+groupbox1={cls="groupbox";text="编码";left=13;top=6;right=302;bottom=68;dl=1;dt=1;edge=1;z=1};
+groupbox2={cls="groupbox";text="解码";left=316;top=6;right=468;bottom=68;dr=1;dt=1;edge=1;z=2};
+groupbox3={cls="groupbox";text="设置";left=484;top=6;right=636;bottom=68;dr=1;dt=1;edge=1;z=3};
+progress={cls="progress";left=25;top=106;right=625;bottom=116;dl=1;dr=1;dt=1;edge=1;max=100;min=0;z=10};
+staticDecode={cls="static";left=318;top=74;right=606;bottom=101;dr=1;dt=1;notify=1;transparent=1;z=12};
+staticEncode={cls="static";text="试试拖放一个文件!";left=25;top=74;right=313;bottom=101;dl=1;dt=1;transparent=1;z=11}
 )
 /*}}*/
 
@@ -50,13 +60,14 @@ var MARGIN_RIGHT = 25;
 var MARGIN_BOTTOM = 25;
 // 不再使用固定 MARGIN_TOP_CUSTOM，改为 layoutCustom() 中动态获取进度条位置
 
+var FRAME_SIZE = 1024;  // cimbar 编码帧原始尺寸，offscreen 固定此大小
 var canvasSide = 600;
 
 var appState = {
 	mode = "idle";
+	testArmed = false;  // 测试待命：true 时编码启动后自动附加解码定时器
 	currentBitmap = null;
 	offscreenBitmap = null;
-	frameRate = 10;
 	encodeTimer = null;
 	decodeTimer = null;
 	encodeFilePath = null;
@@ -64,6 +75,45 @@ var appState = {
 	encodeBuffer = null;  // 截图场景：持有 buffer 引用用于 restart
 	mirrorFlip = false;
 	camZoom = 1.0;  // 解码预览缩放倍率（1.0=默认，取居中正方形）
+	bigFile = null;  // 大文件分块编码状态，null=单文件模式
+	testStats = null;  // 测试统计信息，null=非测试模式
+	settings = {
+		frameRate = 15;        // 编码帧率（5-20 fps），默认 15 与 cimbar-bigfile 对齐
+		redundancy = 2.0;      // 冗余倍数（1.2-8.1x，受 chunk_size 限制）
+		chunkSize = 10 * 1024 * 1024;  // 单块大小（默认 10MB）
+	};
+};
+
+// ===== 大文件分块传输常量 =====
+var MAX_CHUNKS = 7;  // wirehair 解码器 stream_slot = encode_id & 0x7（8 槽位），manifest + 数据 chunk 共 totalChunks+1 个 encode_id，超过 7 会 slot 碰撞
+
+// ===== 设置持久化（config/settings.json）=====
+// 从配置文件加载设置（首次运行为 appState 中的默认值）
+var loadSettings = function(){
+	var settingsPath = ..io.fullpath("/config/settings.json");
+	if(..io.exist(settingsPath)){
+		var s = ..web.json.parse(..string.load(settingsPath));
+		if(s){
+			// 帧率裁剪到 5-20 fps（与原项目 cimbar_send defaultFps=15、web UI min=5 max=20 对齐）
+			if(s.frameRate) appState.settings.frameRate = math.max(5, math.min(20, s.frameRate));
+			// 冗余倍数裁剪到 1.2-8.1x（下限对齐原项目 EncoderPlus.h 最低默认值 1.2x）
+			if(s.redundancy) appState.settings.redundancy = math.max(1.2, math.min(8.1, s.redundancy));
+			if(s.chunkSize) appState.settings.chunkSize = s.chunkSize;
+		}
+	}
+};
+loadSettings();
+
+// 保存设置到配置文件
+var saveSettings = function(){
+	var settingsPath = ..io.fullpath("/config/settings.json");
+	..fsys.createDir(..io.fullpath("/config/"));
+	var s = {
+		frameRate = appState.settings.frameRate;
+		redundancy = appState.settings.redundancy;
+		chunkSize = appState.settings.chunkSize;
+	};
+	..string.save(settingsPath, ..web.json.stringify(s, true));
 };
 
 // 缩放档位：滚轮每次切换一档
@@ -126,17 +176,11 @@ layoutCustom = function(){
 	}
 
 	mainForm.custom.setPos(left, top, canvasSide, canvasSide);
-	if(appState.offscreenBitmap){
-		appState.offscreenBitmap.dispose();
-		appState.offscreenBitmap = null;
-	}
 };
 
 ensureOffscreen = function(){
-	if(canvasSide <= 0) return null;
-	if(!appState.offscreenBitmap || appState.offscreenBitmap.width != canvasSide){
-		if(appState.offscreenBitmap) appState.offscreenBitmap.dispose();
-		appState.offscreenBitmap = gdip.bitmap(canvasSide, canvasSide);
+	if(!appState.offscreenBitmap){
+		appState.offscreenBitmap = gdip.bitmap(FRAME_SIZE, FRAME_SIZE);
 	}
 	return appState.offscreenBitmap;
 };
@@ -151,10 +195,9 @@ drawCanvas = function(){
 	// 先清空整个画布为深灰底色
 	g.clear(0xFF2B2B2B);
 
-	if(appState.currentBitmap){
+	if(appState.currentBitmap && appState.currentBitmap[["pBitmap"]]){
 		var bmpW = appState.currentBitmap.width;
 		var bmpH = appState.currentBitmap.height;
-		dlog("DRAW", "drawCanvas: canvasSide=%d, bmpSize=%dx%d, mode=%s", canvasSide, bmpW, bmpH, appState.mode);
 
 		if(appState.mode == "decoding"){
 			// 解码模式：取居中最大正方形，再按 camZoom 缩放
@@ -177,27 +220,27 @@ drawCanvas = function(){
 
 			if(appState.mirrorFlip){
 				g.scale(-1, 1);
-				g.translate(-canvasSide, 0);
-				g.drawImageRectRect(appState.currentBitmap, 0, 0, canvasSide, canvasSide, srcLeft, srcTop, srcSide, srcSide);
+				g.translate(-FRAME_SIZE, 0);
+				g.drawImageRectRect(appState.currentBitmap, 0, 0, FRAME_SIZE, FRAME_SIZE, srcLeft, srcTop, srcSide, srcSide);
 				g.resetTransform();
 			}
 			else {
-				g.drawImageRectRect(appState.currentBitmap, 0, 0, canvasSide, canvasSide, srcLeft, srcTop, srcSide, srcSide);
+				g.drawImageRectRect(appState.currentBitmap, 0, 0, FRAME_SIZE, FRAME_SIZE, srcLeft, srcTop, srcSide, srcSide);
 			}
 		}
 		else {
-			// 编码模式：等比缩放 + letterbox/pillarbox
-			var scaleX = canvasSide / bmpW;
-			var scaleY = canvasSide / bmpH;
+			// 编码模式：等比缩放 + letterbox/pillarbox（目标为 FRAME_SIZE）
+			var scaleX = FRAME_SIZE / bmpW;
+			var scaleY = FRAME_SIZE / bmpH;
 			var scale = math.min(scaleX, scaleY);
 			var dstW = math.floor(bmpW * scale);
 			var dstH = math.floor(bmpH * scale);
-			var dstX = math.floor((canvasSide - dstW) / 2);
-			var dstY = math.floor((canvasSide - dstH) / 2);
+			var dstX = math.floor((FRAME_SIZE - dstW) / 2);
+			var dstY = math.floor((FRAME_SIZE - dstH) / 2);
 
 			if(appState.mirrorFlip){
 				g.scale(-1, 1);
-				g.translate(-canvasSide, 0);
+				g.translate(-FRAME_SIZE, 0);
 				g.drawImageRectRect(appState.currentBitmap, dstX, dstY, dstW, dstH, 0, 0, bmpW, bmpH);
 				g.resetTransform();
 			}
@@ -205,43 +248,388 @@ drawCanvas = function(){
 				g.drawImageRectRect(appState.currentBitmap, dstX, dstY, dstW, dstH, 0, 0, bmpW, bmpH);
 			}
 		}
-	}
-
-	// 解码/测试模式下叠加四角锚点指示器
-	if(appState.mode == "decoding" || appState.mode == "testing"){
-		var scanResult = cimbar.decodeGetScanResult();
-		var anchorColor;
-		if(scanResult == 1) anchorColor = 0xFF00FF00;      // 绿色：提取成功
-		elseif(scanResult == 2) anchorColor = 0xFFFFFF00;   // 黄色：需锐化
-		else anchorColor = 0xFFFFFFFF;                      // 白色：未检测到锚点
-
-		var cornerLen = math.max(math.floor(canvasSide * 0.08), 10);
-     		var pen = gdip.pen(anchorColor, 5);
-		// 左上角 L 形
-		g.drawLine(pen, 0, 0, cornerLen, 0);
-		g.drawLine(pen, 0, 0, 0, cornerLen);
-		// 右上角 L 形
-		g.drawLine(pen, canvasSide-1, 0, canvasSide-1-cornerLen, 0);
-		g.drawLine(pen, canvasSide-1, 0, canvasSide-1, cornerLen);
-		// 左下角 L 形
-		g.drawLine(pen, 0, canvasSide-1, cornerLen, canvasSide-1);
-		g.drawLine(pen, 0, canvasSide-1, 0, canvasSide-1-cornerLen);
-		// 右下角 L 形
-		g.drawLine(pen, canvasSide-1, canvasSide-1, canvasSide-1-cornerLen, canvasSide-1);
-		g.drawLine(pen, canvasSide-1, canvasSide-1, canvasSide-1, canvasSide-1-cornerLen);
-		pen.delete();
 	}
 
 	g.delete();
 
-	var gDst = gdip.graphics(mainForm.custom.hwnd);
-	gDst.drawImageRect(offscreen, 0, 0, canvasSide, canvasSide);
-	gDst.delete();
+	// 用 StretchBlt 替代 GDI+ drawImageRect 呈现，利用 GDI 硬件加速
+	var hBmp = offscreen.copyHandle();
+	var hdcDst = ::GetDC(mainForm.custom.hwnd);
+	var hdcSrc = ::CreateCompatibleDC(hdcDst);
+	::SelectObject(hdcSrc, hBmp);
+	::SetStretchBltMode(hdcDst, 3/*HALFTONE*/);
+	::StretchBlt(hdcDst, 0, 0, canvasSide, canvasSide, hdcSrc, 0, 0, FRAME_SIZE, FRAME_SIZE, 0x00CC0020/*SRCCOPY*/);
+	::DeleteDC(hdcSrc);
+	::ReleaseDC(mainForm.custom.hwnd, hdcDst);
+	::DeleteObject(hBmp);
+
+	// 绘制锚点指示器（在 custom 控件外侧，不影响 offscreen 数据）
+	drawAnchors();
+};
+
+// 在 custom 控件四角外侧绘制锚点指示器（不影响 offscreen 数据）
+drawAnchors = function(){
+	if(appState.mode != "decoding" && appState.mode != "testing") return;
+
+	var scanResult = cimbar.decodeGetScanResult();
+	var anchorColor;
+	if(scanResult == 1) anchorColor = 0xFF00FF00;      // 绿色：提取成功
+	elseif(scanResult == 2) anchorColor = 0xFFFFFF00;   // 黄色：需锐化
+	else anchorColor = 0xFFFFFFFF;                      // 白色：未检测到锚点
+
+	// 获取 custom 控件在 mainForm 客户区中的位置
+	var rect = mainForm.custom.getRect(false);
+	var cx = rect.left;
+	var cy = rect.top;
+	var cw = rect.right - rect.left;
+	var ch = rect.bottom - rect.top;
+
+	var cornerLen = math.max(math.floor(cw * 0.08), 10);
+	var gap = 3;  // 与控件边缘留 3px 间隙
+	var pen = gdip.pen(anchorColor, 5);
+
+	var hdc = ::GetDC(mainForm.hwnd);
+	if(!hdc) { pen.delete(); return; }
+	var g = gdip.graphics(hdc);
+	if(!g[["pGraphics"]]) {
+		::ReleaseDC(mainForm.hwnd, hdc);
+		pen.delete();
+		return;
+	}
+
+	// 左上角 ┌：向右 + 向下
+	g.drawLine(pen, cx - gap, cy - gap, cx - gap + cornerLen, cy - gap);
+	g.drawLine(pen, cx - gap, cy - gap, cx - gap, cy - gap + cornerLen);
+	// 右上角 ┐：向左 + 向下
+	g.drawLine(pen, cx + cw + gap, cy - gap, cx + cw + gap - cornerLen, cy - gap);
+	g.drawLine(pen, cx + cw + gap, cy - gap, cx + cw + gap, cy - gap + cornerLen);
+	// 左下角 └：向右 + 向上
+	g.drawLine(pen, cx - gap, cy + ch + gap, cx - gap + cornerLen, cy + ch + gap);
+	g.drawLine(pen, cx - gap, cy + ch + gap, cx - gap, cy + ch + gap - cornerLen);
+	// 右下角 ┘：向左 + 向上
+	g.drawLine(pen, cx + cw + gap, cy + ch + gap, cx + cw + gap - cornerLen, cy + ch + gap);
+	g.drawLine(pen, cx + cw + gap, cy + ch + gap, cx + cw + gap, cy + ch + gap - cornerLen);
+
+	pen.delete();
+	g.delete();
+	::ReleaseDC(mainForm.hwnd, hdc);
+};
+
+// 从文件读取指定偏移和大小的数据块
+readFileChunk = function(path, offset, size){
+	var f = ..io.open(path, "rb");
+	if(!f) return null;
+	f.seek("set", offset);
+	var data = f.read(size);
+	f.close();
+	if(!data || #data <= 0) return null;
+	return data;
+};
+
+// 计算文件 SHA-256（流式，避免一次性加载大文件到内存）
+// 返回小写 hex 字符串（与 sha256sum 对齐）
+computeFileSha256 = function(path){
+	var c = ..crypt(,0x18/*_PROV_RSA_AES*/);
+	var hashHex = c.hashFile(path, false, 0x800C/*_CALG_SHA_256*/);
+	return hashHex;
+};
+
+// 计算内存数据 SHA-256
+computeBufferSha256 = function(data){
+	return ..crypt.sha256(data, false);
+};
+
+// 从文件名提取 basename（去除最后一个后缀）
+// 例：myfile.tar.gz → myfile.tar
+getBasename = function(fileName){
+	// 反转后用 string.find(plain=true) 查找第一个 "."，避免 pattern 语法差异
+	// 反转字符串中点的位置 start 对应原字符串位置 #fileName - start + 1
+	var rev = ..string.reverse(fileName);
+	var start = ..string.find(rev, ".", 1, true);
+	if(start) return ..string.left(fileName, #fileName - start);
+	return fileName;
+};
+
+// 生成 chunk 文件名：<basename>.part<NN>.bin
+// 零填充宽度：< 100 块用 2 位，< 1000 块用 3 位
+getChunkFileName = function(basename, chunkIdx, chunkCount){
+	var width = chunkCount < 100 ? 2 : 3;
+	var partNum = ..string.format("%0" + width + "d", chunkIdx);
+	return basename + ".part" + partNum + ".bin";
+};
+
+// 从 chunk 文件名提取索引（.partNN.bin → NN）
+extractChunkIndex = function(filename){
+	// aardio pattern 用 % 转义字面量点号（\ 不是 pattern 转义符）
+	var match = ..string.match(filename, "%.part(%d+)%.bin$");
+	return match ? tonumber(match) : null;
+};
+
+// 生成 manifest JSON（cimbar-bigfile 兼容格式）
+// spec: https://github.com/xPeiPeix/cimbar-bigfile/blob/main/docs/manifest-spec.md
+generateManifestJson = function(fileName, fileSize, chunkCount, chunkSize, encodeIdBase, totalSha256, chunkInfos){
+	var manifest = {
+		version = 1;
+		tool = "cimbar-bigfile";
+		filename = fileName;
+		total_size = fileSize;
+		sha256 = totalSha256;
+		chunk_size = chunkSize;
+		chunk_count = chunkCount;
+		encode_id_base = encodeIdBase;
+		chunks = chunkInfos;  // 数组：{index, size, sha256}
+	};
+	// JSON 输出不缩进（节省传输大小，每字节都要点击多次保存对话框）
+	return ..web.json.stringify(manifest, false);
+};
+
+// 切换到指定 chunk 进行编码
+// idx=0: manifest, idx=1..N: 对应的数据 chunk 0..N-1
+// 大文件模式使用 encoder stream 缓存，避免循环切换时重建产生重复 fountain block
+switchToChunk = function(idx){
+	var bf = appState.bigFile;
+	if(!bf) return;
+
+	// 切换前：保存当前 stream 到缓存（currentIdx >= 0 表示有活跃的 encoder）
+	if(bf.currentIdx >= 0){
+		var curEncodeId = bf.encodeIdBase + bf.currentIdx;
+		cimbar.encodeSaveStream(curEncodeId);
+	}
+
+	if(idx == 0){
+		// 编码 manifest（encode_id = encode_id_base）
+		var encodeId = bf.encodeIdBase;
+		// 尝试从缓存恢复
+		var restored = cimbar.encodeRestoreStream(encodeId);
+		if(restored == 0){
+			dlog("ENCODE", "switchToChunk: manifest restored from cache (encode_id=%d)", encodeId);
+		}
+		else {
+			dlog("ENCODE", "switchToChunk: manifest (encode_id=%d)", encodeId);
+			cimbar.encodeBufferEx(bf.manifestBuffer, "manifest.json", appState.encodeMode, 16, encodeId);
+		}
+	}
+	else {
+		var chunkIdx = idx - 1;  // 转为 0-based chunk 索引
+		if(chunkIdx >= bf.totalChunks) return;
+		var encodeId = bf.encodeIdBase + idx;
+		// 尝试从缓存恢复
+		var restored = cimbar.encodeRestoreStream(encodeId);
+		if(restored == 0){
+			dlog("ENCODE", "switchToChunk: chunk %d/%d restored from cache (encode_id=%d)", idx, bf.totalChunks, encodeId);
+		}
+		else {
+			// 缓存未命中：读取文件数据，创建新 encoder stream
+			var chunkSize = appState.settings.chunkSize;
+			var offset = chunkIdx * chunkSize;
+			var readSize = math.min(chunkSize, bf.fileSize - offset);
+			dlog("ENCODE", "switchToChunk: chunk %d/%d (encode_id=%d, offset=%d, size=%d)", idx, bf.totalChunks, encodeId, offset, readSize);
+			var chunkData = readFileChunk(bf.filePath, offset, readSize);
+			if(!chunkData){
+				mainForm.staticEncode.text = "读取文件块失败！";
+				return;
+			}
+			var chunkName = getChunkFileName(bf.basename, chunkIdx, bf.totalChunks);
+			cimbar.encodeBufferEx(chunkData, chunkName, appState.encodeMode, 16, encodeId);
+		}
+	}
+	bf.currentIdx = idx;
+	bf.chunkFrameCount = 0;
+};
+
+// 大文件分块编码入口
+startBigFileEncoding = function(filePath){
+	// 保存 testArmed 标志（stopAll 会清除它，但测试待命需跨过 stopAll 保留）
+	var wasTestArmed = appState.testArmed;
+	stopAll();
+	appState.testArmed = wasTestArmed;  // 恢复测试待命状态
+
+	var mode = getModeValue();
+	appState.encodeMode = mode;
+
+	// 获取文件信息
+	var fileSize = ..io.fileSize(filePath);
+	if(fileSize <= 0){
+		mainForm.staticEncode.text = "无法读取文件大小！";
+		return;
+	}
+
+	var fileName = ..io.splitpath(filePath).name + ..io.splitpath(filePath).ext;
+	var chunkSize = appState.settings.chunkSize;
+	var chunkCount = math.ceil(fileSize / chunkSize);
+
+	if(chunkCount > MAX_CHUNKS){
+		mainForm.staticEncode.text = ..string.format("文件过大！最多支持 %d 个数据块（当前 %d 块），请调大 chunk_size 或减小文件", MAX_CHUNKS, chunkCount);
+		return;
+	}
+
+	// encode_id_base：取当前时间戳低 7 位（与 wirehair 协议 encode_id 7-bit 字段对齐）
+	// DLL 端 cimbar_encode_buffer_ex 实际只用低 7 位（encode_id & 0x7F）
+	// 这样 manifest 记录的值与 DLL 实际使用的 encode_id 完全一致，避免 CFC 端混淆
+	// time() 返回 time 对象（table），需 tonumber() 转为 unix 时间戳数值后才能位运算
+	var encodeIdBase = tonumber(time()) & 0x7F;
+	var basename = getBasename(fileName);
+
+	// 校验 encode_id 不会回绕：base + chunkCount 必须 ≤ 127
+	// wirehair 协议 encode_id 为 7-bit，回绕会导致中间 chunk（相同 file_size）发生 stream 碰撞
+	if(encodeIdBase + chunkCount > 127){
+		mainForm.staticEncode.text = ..string.format("文件过大或会话冲突！base=%d, chunks=%d, 上限 127", encodeIdBase, chunkCount);
+		return;
+	}
+
+	dlog("ENCODE", "startBigFileEncoding: %s, size=%d, chunks=%d, encode_id_base=%d", fileName, fileSize, chunkCount, encodeIdBase);
+	mainForm.staticEncode.text = "正在计算 SHA-256 校验值...";
+
+	// 计算原文件全文 SHA-256（流式，避免一次性加载）
+	var totalSha256 = computeFileSha256(filePath);
+	dlog("ENCODE", "totalSha256: %s", totalSha256);
+
+	// 逐块读取计算每个 chunk 的 sha256
+	var chunkInfos = {};
+	for(i=0; chunkCount-1){
+		var offset = i * chunkSize;
+		var readSize = math.min(chunkSize, fileSize - offset);
+		var chunkData = readFileChunk(filePath, offset, readSize);
+		var chunkSha = chunkData ? computeBufferSha256(chunkData) : "";
+		..table.push(chunkInfos, {
+			index = i;
+			size = readSize;
+			sha256 = chunkSha;
+		});
+		// 更新进度（SHA 计算阶段）
+		mainForm.progress.pos = math.floor((i + 1) * 30 / chunkCount);
+		mainForm.staticEncode.text = ..string.format("计算校验值... %d/%d", i + 1, chunkCount);
+	}
+
+	// 生成 manifest
+	var manifestJson = generateManifestJson(fileName, fileSize, chunkCount, chunkSize, encodeIdBase, totalSha256, chunkInfos);
+	var manifestBuffer = ..raw.buffer(manifestJson);
+
+	dlog("ENCODE", "manifest: %s", manifestJson);
+
+	// 初始化大文件状态
+	appState.bigFile = {
+		filePath = filePath;
+		fileName = fileName;
+		basename = basename;
+		fileSize = fileSize;
+		totalChunks = chunkCount;
+		currentIdx = -1;  // 尚未开始
+		chunkFrameCount = 0;
+		encodeIdBase = encodeIdBase;
+		manifestBuffer = manifestBuffer;
+	};
+
+	// 从 manifest 开始编码
+	switchToChunk(0);
+
+	appState.mode = "encoding";
+	appState.encodeFilePath = filePath;
+	mainForm.staticEncode.text = ..string.format("大文件编码中... 共 %d 块", chunkCount);
+	mainForm.progress.pos = 0;
+
+	// 测试待命：编码成功启动后附加解码定时器
+	if(appState.testArmed){
+		// slot 碰撞检查已在上方 MAX_CHUNKS 校验中统一处理
+		if(!attachTestDecoder()){
+			return;
+		}
+	}
+
+	// ===== flicker 机制说明（分析用，无需修改逻辑）=====
+	// 原项目（libcimbar 原生 cimbar_send + cimbar_recv）的二维码"抖动"由两个独立机制叠加：
+	//
+	// 1. 数据层 flicker（必然，fountain code 本质）：
+	//    fountain_encoder_stream::encode_new_block() 每帧调用 _encoder.encode(_block++, ...)
+	//    在 GF(256) 上对原始 block 做线性组合，block_num 每帧递增 → 每帧产生的 cimbar 图像数据都不同
+	//    这是 fountain code 的核心特性：接收端只要凑齐足够多的独立帧就能解码，多余帧自动忽略
+	//    参考：libcimbar-0.6.5/src/lib/fountain/fountain_encoder_stream.h#L78
+	//
+	// 2. 渲染层 shake（可选，抗混叠）：
+	//    libcimbar 原生 OpenGL 渲染器 gl_2d_display::shake() 循环遍历 4 个平移位置：
+	//      (0,0) → (-8px,-8px) → (0,0) → (+8px,+8px) → 循环
+	//    目的：打破屏幕像素与摄像头像素之间的 moiré 混叠（Aliasing）
+	//    参考：libcimbar-0.6.5/src/lib/gui/gl_2d_display.h#L34-L44
+	//
+	// 本项目采用 GDI+ 直接绘制（无 OpenGL），省略了渲染层 shake，原因：
+	//   - GDI+ 的 drawImageRectRect 自带双线性插值，已提供抗混叠
+	//   - 数据层 flicker 已足够保证 fountain code 的独立性
+	//   - shake 主要解决屏幕/相机像素严格对齐时的 moiré，实际使用中摄像头有自然抖动
+	// 如需进一步提升极端场景下的解码率，可在 drawCanvas 中添加 ±2px 的循环偏移（模拟 shake）
+
+	// 启动编码定时器
+	var interval = math.max(math.floor(1000 / appState.settings.frameRate), 30);
+	appState.encodeTimer = mainForm.setInterval(interval, function(){
+		var bmp = cimbar.nextFrameBitmap();
+		if(!bmp){
+			// 当前 chunk 帧耗尽（auto-restart 已触发），重新编码当前 chunk
+			switchToChunk(appState.bigFile.currentIdx);
+			return;
+		}
+		// 确保 bitmap 的 GDI+ 指针有效（dispose 后 table 仍存在但 pBitmap 为 null）
+		if(!bmp[["pBitmap"]]){
+			dlog("ENCODE", "nextFrameBitmap returned invalid bitmap (pBitmap=null)");
+			return;
+		}
+
+		if(appState.currentBitmap) appState.currentBitmap.dispose();
+		appState.currentBitmap = bmp;
+		drawCanvas();
+
+		var info = cimbar.getEncodeInfo();
+		if(info){
+			var bf = appState.bigFile;
+			bf.chunkFrameCount++;
+
+			// 计算切换阈值（单位：帧）
+			// info.recommended 是 4x 冗余所需帧数（DLL 端 = ceil(blocksRequired*4/chunksPerFrame)）
+			// 据此推算用户设定倍数：threshold = ceil(recommended * redundancy / 4.0)
+			// 测试模式不强制 4x：本机自测无光学损失，2x（用户默认）远超 wirehair 1x+ε 解码需求
+			// wirehair 编码确定性，多轮循环帧相同被去重，threshold 不足会无法解码，但 2x 已足够
+			var threshold = math.max(1, math.ceil(info.recommended * appState.settings.redundancy / 4.0));
+			// manifest 是解码前提，至少发 5 帧确保解码器能抓帧完成解码
+			// manifest 数据量小（~1 block），计算出的 threshold 可能仅 1 帧，
+			// 解码器 2x 频率也容易错过，5 帧（@15fps ≈ 333ms）给足余量
+			if(bf.currentIdx == 0 && threshold < 5) threshold = 5;
+
+			// 计算整体进度
+			var chunkProgress = threshold > 0
+				? math.floor(bf.chunkFrameCount * 100 / threshold)
+				: 0;
+			var overallProgress = math.min(math.floor((bf.currentIdx * 100 + chunkProgress) / (bf.totalChunks + 1)), 100);
+
+			mainForm.progress.pos = overallProgress;
+
+			// 显示当前块信息（始终写入 staticEncode，与解码侧 staticDecode 分离）
+			var chunkLabel = bf.currentIdx == 0 ? "清单" : ..string.format("块 %d/%d", bf.currentIdx, bf.totalChunks);
+			mainForm.staticEncode.text = ..string.format("编码中 %s 帧:%d/%d 进度:%d%%",
+				chunkLabel, bf.chunkFrameCount, threshold, overallProgress);
+
+			// 当前 chunk 播放完一轮后切换到下一个
+			if(threshold > 0 && bf.chunkFrameCount >= threshold){
+				var nextIdx = (bf.currentIdx + 1) % (bf.totalChunks + 1);
+				switchToChunk(nextIdx);
+			}
+		}
+	});
 };
 
 // 通用编码启动函数（文件路径或内存数据）
 startEncoding = function(filePath, bufferData){
+	// 大文件自动走分块编码
+	if(filePath && !bufferData){
+		var fileSize = ..io.fileSize(filePath);
+		if(fileSize >= appState.settings.chunkSize){
+			dlog("ENCODE", "startEncoding: big file detected (%d bytes), using chunked encoding", fileSize);
+			startBigFileEncoding(filePath);
+			return;
+		}
+	}
+
+	// 保存 testArmed 标志（stopAll 会清除它，但测试待命需跨过 stopAll 保留）
+	var wasTestArmed = appState.testArmed;
 	stopAll();
+	appState.testArmed = wasTestArmed;  // 恢复测试待命状态
 
 	var mode = getModeValue();
 	appState.encodeMode = mode;
@@ -265,15 +653,22 @@ startEncoding = function(filePath, bufferData){
 
 	if(!ok){
 		dlog("ENCODE", "encode FAILED");
-		mainForm.static.text = "编码失败！请检查文件路径和格式。";
+		mainForm.staticEncode.text = "编码失败！请检查文件路径和格式。";
 		return;
 	}
 
 	appState.mode = "encoding";
-	mainForm.static.text = "正在编码...";
+	mainForm.staticEncode.text = "正在编码...";
 	mainForm.progress.pos = 0;
 
-	var interval = math.max(math.floor(1000 / appState.frameRate), 30);
+	// 测试待命：编码成功启动后附加解码定时器
+	if(appState.testArmed){
+		if(!attachTestDecoder()){
+			return;
+		}
+	}
+
+	var interval = math.max(math.floor(1000 / appState.settings.frameRate), 30);
 	appState.encodeTimer = mainForm.setInterval(interval, function(){
 		var bmp = cimbar.nextFrameBitmap();
 		if(!bmp){
@@ -284,6 +679,11 @@ startEncoding = function(filePath, bufferData){
 			else {
 				cimbar.encodeFile(appState.encodeFilePath, appState.encodeMode, 16);
 			}
+			return;
+		}
+		// 确保 bitmap 的 GDI+ 指针有效
+		if(!bmp[["pBitmap"]]){
+			dlog("ENCODE", "nextFrameBitmap returned invalid bitmap (pBitmap=null)");
 			return;
 		}
 
@@ -301,62 +701,499 @@ startEncoding = function(filePath, bufferData){
 				? math.floor(displayFrame * 100 / info.recommended)
 				: 0;
 			mainForm.progress.pos = math.min(pct, 100);
-			mainForm.static.text = string.format("编码中 帧:%d/%d", displayFrame, info.recommended);
+			// 单文件模式不走分块逻辑，DLL 内部固定 8x 自动重启
+			// 这里仅展示用户设定的冗余参数值（仅作参考，不影响实际编码）
+			var redundancyLabel = tostring(appState.settings.redundancy) + "x";
+			mainForm.staticEncode.text = string.format("编码中 帧:%d/%d [%s]", displayFrame, info.recommended, redundancyLabel);
 		}
 	});
 };
 
-// 隐藏测试功能：combobox 输入 test + 点击图像解码
-// 流程：全屏截图 → startEncoding 编码 → 独立 decodeTimer 从画布截取解码
-runTest = function(){
-	stopAll();
-	var mode = getModeValue();
-	mainForm.static.text = "测试：正在截屏...";
-
-	// 1. 全屏截图
-	mainForm.hide();
-	win.delay(300);
-	var screenBmp = gdip.snap();
-	mainForm.show();
-	if(!screenBmp){
-		mainForm.static.text = "测试：截屏失败！";
-		return;
-	}
-
-	// 2. 转为 PNG buffer
-	var pngBuffer = screenBmp.saveToBuffer("*.png");
-	screenBmp.dispose();
-
-	// 3. 复用 startEncoding 启动编码（编码定时器、帧循环、进度显示）
-	startEncoding(, pngBuffer);
-	if(appState.mode != "encoding") return;  // 编码失败
-
-	// 4. 配置解码
+// 测试模式：编码已启动后，附加独立的解码定时器从画布抓帧
+// 调用时机：startEncoding / startBigFileEncoding 成功进入 encoding 模式后，若 testArmed=true 则调用
+attachTestDecoder = function(){
+	var mode = appState.encodeMode;  // 复用编码时已确定的 mode
 	if(!cimbar.decodeConfigure(mode)){
-		mainForm.static.text = "测试：解码配置失败！";
+		mainForm.staticDecode.text = "测试：解码配置失败！";
 		stopAll();
-		return;
+		return false;
 	}
 
-	// 5. 切换为测试模式（保留编码定时器，新增解码定时器）
 	appState.mode = "testing";
+	appState.testArmed = false;  // 消费待命标志
 	appState.camZoom = 1.0;
-	mainForm.static.text = "测试：编解码中...";
+	mainForm.staticDecode.text = "测试：编解码中...";
 
-	// 6. 独立的解码定时器：从画布截取图像喂给解码器
-	appState.decodeTimer = mainForm.setInterval(100, function(){
-		if(!appState.offscreenBitmap) return;
+	// 初始化测试统计：记录开始时间、解码帧数
+	// getTickMs() 返回系统启动后的毫秒数，精度足够计算解码帧率和总时间
+	appState.testStats = {
+		startTimeMs = getTickMs();
+		decodeFrameCount = 0;
+	};
 
-		// 截取当前画布内容（模拟摄像头取景）
-		var capturedBmp = gdip.bitmap(canvasSide, canvasSide);
+	// 解码定时器间隔：编码间隔的一半，确保不丢帧（重复帧由 fountain decoder 自动去重）
+	var encodeInterval = math.max(math.floor(1000 / appState.settings.frameRate), 30);
+	var decodeInterval = math.max(math.floor(encodeInterval / 2), 15);
+	appState.decodeTimer = mainForm.setInterval(decodeInterval, function(){
+		if(!appState.offscreenBitmap || !appState.offscreenBitmap[["pBitmap"]]) return;
+
+		// 2x 整数倍放大模拟 CFC 拍摄，使锚点间距 > 1024（is_granular_scale 阈值）
+		// CFC 拍摄时码在图像中占 1500+ 像素，间距 >> 1024 → 绿色 SUCCESS
+		// 1:1 复制时间距 < 1024 → 黄色 NEEDS_SHARPEN（不影响解码但非最佳）
+		// 必须用 2x 整数倍 + NearestNeighbor，非整数倍缩放破坏锚点像素结构
+		var DECODE_SCALE = 2;
+		var decodeSize = FRAME_SIZE * DECODE_SCALE;
+		var capturedBmp = gdip.bitmap(decodeSize, decodeSize);
+		if(!capturedBmp) return;  // 创建失败时跳过此帧
 		var gCap = capturedBmp.getGraphics();
-		gCap.drawImageRect(appState.offscreenBitmap, 0, 0, canvasSide, canvasSide);
+		if(!gCap || !gCap[["pGraphics"]]) {
+			capturedBmp.dispose();
+			return;
+		}
+		gCap.interpolationMode = 5/*_GdipInterpolationModeNearestNeighbor*/;
+		gCap.drawImageRect(appState.offscreenBitmap, 0, 0, decodeSize, decodeSize);
 		gCap.delete();
 
 		// 喂给解码器
 		decodeOneFrame(capturedBmp);
 		capturedBmp.dispose();
 	});
+	return true;
+};
+
+// ===== 多 stream 解码（大文件分块还原）=====
+
+// 解码状态：跟踪 manifest 和各 chunk 的完成情况
+var decodeState = {
+	manifest = null;     // 已解析的 manifest（null=未收到）
+	chunks = {};         // 已完成的 chunk: { [chunkIdx] = tempPath }
+	tempDir = null;      // 临时目录路径
+};
+
+// 重置解码状态（在 stopAll 和 startDecoding 中调用）
+resetDecodeState = function(){
+	if(decodeState.tempDir && ..io.exist(decodeState.tempDir)){
+		..fsys.delete(decodeState.tempDir);
+	}
+	decodeState.manifest = null;
+	decodeState.chunks = {};
+	decodeState.tempDir = null;
+};
+
+// 处理已完成的 stream（fileId 由 decode_fountain 返回）
+// 大文件模式：从 fileId 直接推断 encode_id，跳过 decodeGetFilename（避免其内部
+//   recover_contents 失败导致弹保存对话框中断整个解码）
+// 单文件模式：保留 decodeGetFilename 获取文件名
+handleDecodedStream = function(fileId){
+	var report = cimbar.getDecodeReport();
+	dlog("DECODE", "handleDecodedStream: fileId=%d, numStreams=%d, numDone=%d",
+		fileId, report.numStreams, report.numDone);
+
+	// 生成临时目录名（用纯数字时间戳，避免冒号等非法字符）
+	var ensureTempDir = function(){
+		if(!decodeState.tempDir){
+			decodeState.tempDir = ..fsys.getTempDir() + "\cimbar_chunks_" + tostring(time(), "%Y%m%d%H%M%S");
+			..fsys.createDir(decodeState.tempDir);
+		}
+	};
+
+	// 大文件模式：从 fileId 低 7 位提取 encode_id（与 FountainMetadata::encode_id 一致）
+	// 编码端 switchToChunk: manifest=encodeIdBase, chunk i=encodeIdBase+1+i
+	var bf = appState.bigFile;
+	if(bf){
+		var encodeId = fileId & 0x7F;
+		if(encodeId == bf.encodeIdBase){
+			// manifest：直接保存，不调用 decodeGetFilename
+			ensureTempDir();
+			var manifestPath = decodeState.tempDir + "\manifest.json";
+			// manifest 是 JSON 文本，用编码端 manifestBuffer 长度作为 expectedSize
+			var manifestExpected = #bf.manifestBuffer;
+			if(!cimbar.decodeSave(fileId, manifestPath, manifestExpected)){
+				// 保存失败不弹对话框、不 stopAll，允许后续帧重试
+				dlog("DECODE", "manifest save failed, fileId=%d, will retry on next frame", fileId);
+				return;
+			}
+			var manifestStr = ..string.load(manifestPath);
+			decodeState.manifest = ..web.json.parse(manifestStr);
+			dlog("DECODE", "manifest parsed: filename=%s, chunk_count=%d",
+				decodeState.manifest.filename, decodeState.manifest.chunk_count);
+			checkAllChunksDone();
+		}
+		else {
+			// 数据 chunk：encode_id - encodeIdBase - 1 = 0-based chunk 索引
+			var chunkIdx = encodeId - bf.encodeIdBase - 1;
+			if(chunkIdx < 0 || chunkIdx >= bf.totalChunks){
+				dlog("DECODE", "WARNING: chunkIdx=%d out of range [0,%d), encodeId=%d, base=%d",
+					chunkIdx, bf.totalChunks, encodeId, bf.encodeIdBase);
+				return;
+			}
+			ensureTempDir();
+			var chunkName = getChunkFileName(bf.basename, chunkIdx, bf.totalChunks);
+			var tempPath = decodeState.tempDir + "\" + chunkName;
+			// 从 manifest 获取该 chunk 的精确原始大小（web.json.parse 返回 1-based 数组）
+			var expectedSize = null;
+			if(decodeState.manifest && decodeState.manifest.chunks){
+				var chunkInfo = decodeState.manifest.chunks[chunkIdx + 1];
+				if(chunkInfo) expectedSize = chunkInfo.size;
+			}
+			if(!cimbar.decodeSave(fileId, tempPath, expectedSize)){
+				// 保存失败不弹对话框、不 stopAll，允许后续帧重试
+				dlog("DECODE", "chunk save failed: %s, fileId=%d, chunkIdx=%d, expectedSize=%s, will retry on next frame",
+					chunkName, fileId, chunkIdx, tostring(expectedSize));
+				return;
+			}
+			decodeState.chunks[chunkIdx] = tempPath;
+			dlog("DECODE", "chunk %d saved: %s", chunkIdx, tempPath);
+			checkAllChunksDone();
+		}
+		return;
+	}
+
+	// 单文件模式（无 bigFile）：需要 decodeGetFilename 获取文件名
+	var filename = cimbar.decodeGetFilename(fileId);
+	dlog("DECODE", "single-file mode: filename=%s", filename ? filename : "(null)");
+	if(filename){
+		saveSingleFile(fileId, filename);
+	}
+	else {
+		var fallbackName = ..string.format("stream_%d.dat", fileId);
+		saveSingleFile(fileId, fallbackName);
+	}
+};
+
+// 统计已接收的数据 chunk 数量（遍历 decodeState.chunks）
+// 与 DLL 的 numDone 不同，此函数只统计数据 chunk，不含 manifest
+countDoneChunks = function(){
+	if(!decodeState.manifest){
+		// manifest 未解码时，统计 chunks 表中的条目数
+		var count = 0;
+		for(k,v in decodeState.chunks) count++;
+		return count;
+	}
+	var count = 0;
+	for(i=0; decodeState.manifest.chunk_count-1){
+		if(decodeState.chunks[i]) count++;
+	}
+	return count;
+};
+
+// 检查是否所有 chunk 已完成
+var _lastCheckDone = -1;  // 独立变量，aardio 不允许给函数赋属性
+checkAllChunksDone = function(){
+	if(!decodeState.manifest) return;  // 还没收到 manifest
+
+	var expected = decodeState.manifest.chunk_count;
+	var done = countDoneChunks();
+
+	// 仅在 done 变化时输出日志（避免每帧重复）
+	if(done != _lastCheckDone){
+		_lastCheckDone = done;
+		dlog("DECODE", "checkAllChunksDone: %d/%d, numDone=%d", done, expected, cimbar.getDecodeReport().numDone);
+	}
+
+	if(done >= expected){
+		reassembleChunks();
+	}
+};
+
+// 拼接所有 chunk 还原原始文件（流式 + SHA-256 校验）
+// 1. 逐块校验 SHA-256（manifest.chunks[].sha256）
+// 2. 流式拼接（1MB 缓冲，避免一次性加载所有 chunk 到内存）
+// 3. 增量计算整体 SHA-256（边拼接边算，省一遍全文件读）
+// 4. 整体 SHA-256 校验（manifest.sha256）
+reassembleChunks = function(){
+	// 先停定时器
+	if(appState.decodeTimer){
+		mainForm.clearInterval(appState.decodeTimer);
+		appState.decodeTimer = null;
+	}
+
+	var manifest = decodeState.manifest;
+	mainForm.staticDecode.text = "所有块已接收，正在校验与拼接...";
+	mainForm.progress.pos = 0;
+
+	// 1. 逐块校验 SHA-256
+	// 注意：generateManifestJson 中 chunkInfos 用 ..table.push 写入（0-based 索引 i），
+	// 序列化为 JSON 数组后，web.json.parse 解析回 aardio table 时为 1-based，
+	// 所以 manifest.chunks[i+1] 对应第 i 个 chunk（i 从 0 开始）
+	for(i=0; manifest.chunk_count-1){
+		var chunkPath = decodeState.chunks[i];
+		if(!chunkPath || !..io.exist(chunkPath)){
+			mainForm.staticDecode.text = ..string.format("块 %d 缺失！", i);
+			return;
+		}
+		var expectedSha = manifest.chunks[i+1].sha256;
+		var actualSha = computeFileSha256(chunkPath);
+		if(actualSha != expectedSha){
+			mainForm.staticDecode.text = ..string.format("块 %d 校验失败！期望 %s，实际 %s", i, expectedSha, actualSha);
+			dlog("DECODE", "chunk %d SHA mismatch: expected=%s, actual=%s", i, expectedSha, actualSha);
+			return;
+		}
+		mainForm.progress.pos = math.floor((i + 1) * 50 / manifest.chunk_count);
+		mainForm.staticDecode.text = ..string.format("校验块... %d/%d", i + 1, manifest.chunk_count);
+	}
+
+	// 2. 弹出保存对话框（默认文件名来自 manifest.filename）
+	var defaultName = manifest.filename ? manifest.filename : "output.bin";
+	var savePath = fsys.dlg.save("All files|*.*||", "保存解码文件", , mainForm.hwnd, , defaultName);
+	if(!savePath){
+		mainForm.staticDecode.text = "已取消保存。";
+		stopAll();
+		return;
+	}
+
+	// 3. 流式拼接 + 增量 SHA-256 计算（单遍扫描，避免再读一次文件）
+	var outFile = ..io.open(savePath, "wb");
+	if(!outFile){
+		mainForm.staticDecode.text = "保存失败！无法创建文件。";
+		stopAll();
+		return;
+	}
+
+	// 创建增量 SHA-256 哈希对象（边拼接边计算，省一遍全文件读）
+	var cryptCtx = ..crypt(,0x18/*_PROV_RSA_AES*/);
+	var hashObj = cryptCtx.createHashBySha256();
+
+	var totalWritten = 0;
+	var expectedTotal = manifest.total_size;
+	var bufSize = 1024 * 1024;  // 1MB 缓冲
+	for(i=0; manifest.chunk_count-1){
+		var chunkPath = decodeState.chunks[i];
+		var f = ..io.open(chunkPath, "rb");
+		if(!f){
+			outFile.close();
+			hashObj.destroy();
+			mainForm.staticDecode.text = ..string.format("无法读取块 %d", i);
+			stopAll();
+			return;
+		}
+		while(true){
+			var data = f.read(bufSize);
+			if(!data || #data <= 0) break;
+			outFile.write(data);
+			hashObj.hashData(data);  // 增量喂入哈希
+			totalWritten += #data;
+		}
+		f.close();
+		mainForm.progress.pos = 50 + math.floor((i + 1) * 40 / manifest.chunk_count);
+		mainForm.staticDecode.text = ..string.format("拼接中... %d/%d 块 (%d/%d 字节)", i + 1, manifest.chunk_count, totalWritten, expectedTotal);
+	}
+	outFile.close();
+
+	// 4. 整体 SHA-256 校验（从增量哈希对象取最终值，无需再读文件）
+	mainForm.staticDecode.text = "正在校验整体 SHA-256...";
+	var finalSha = hashObj.getHexValue(false);  // false=小写 hex（与 manifest 对齐）
+	hashObj.destroy();
+
+	if(finalSha != manifest.sha256){
+		mainForm.staticDecode.text = ..string.format("整体校验失败！期望 %s，实际 %s", manifest.sha256, finalSha);
+		dlog("DECODE", "overall SHA256 mismatch: expected=%s, actual=%s", manifest.sha256, finalSha);
+		stopAll();
+		return;
+	}
+
+	mainForm.staticDecode.text = ..string.format("校验通过，已保存：%s (%d 字节)", savePath, totalWritten);
+	mainForm.progress.pos = 100;
+	dlog("DECODE", "reassembled to %s, %d bytes, sha256=%s", savePath, totalWritten, finalSha);
+
+	// 测试模式：弹出小结对话框（须在 stopAll 之前，stopAll 会清理 testStats）
+	if(appState.testStats){
+		showTestSummary(totalWritten, appState.bigFile ? appState.bigFile.totalChunks : 1);
+	}
+
+	stopAll();
+};
+
+// 测试模式小结对话框：显示编解码统计信息
+// fileSize: 解码出的文件字节数
+// chunkCount: 分块数量（单文件为 1）
+showTestSummary = function(fileSize, chunkCount){
+	var stats = appState.testStats;
+	if(!stats) return;
+
+	var totalSec = (getTickMs() - stats.startTimeMs) / 1000.0;
+
+	// 解码等效速率（字节/秒）
+	var speed = totalSec > 0 ? fileSize / totalSec : 0;
+
+	// 格式化文件大小
+	var formatSize = function(bytes){
+		if(bytes >= 1024 * 1024) return ..string.format("%.2f MB", bytes / 1024 / 1024);
+		if(bytes >= 1024) return ..string.format("%.2f KB", bytes / 1024);
+		return ..string.format("%d B", bytes);
+	};
+
+	// 格式化速率
+	var formatSpeed = function(bytesPerSec){
+		if(bytesPerSec >= 1024 * 1024) return ..string.format("%.2f MB/s", bytesPerSec / 1024 / 1024);
+		if(bytesPerSec >= 1024) return ..string.format("%.2f KB/s", bytesPerSec / 1024);
+		return ..string.format("%.0f B/s", bytesPerSec);
+	};
+
+	// 编码模式文本
+	var modeText = "";
+	if(appState.encodeMode == cimbar.MODE_4C) modeText = "4C";
+	elseif(appState.encodeMode == cimbar.MODE_BU) modeText = "Bu";
+	elseif(appState.encodeMode == cimbar.MODE_BM) modeText = "Bm";
+	else modeText = "B";
+
+	// 解码帧率
+	var decodeFps = totalSec > 0 ? stats.decodeFrameCount / totalSec : 0;
+
+	// 分块大小（MB）
+	var chunkMB = appState.settings.chunkSize / 1024 / 1024;
+
+	var summary = ..string.format(
+		"===== 测试小结 =====" +'\r\n'+
+		"文件大小：%s" +'\r\n'+
+		"编码模式：%s" +'\r\n'+
+		"编码帧率：%d fps" +'\r\n'+
+		"分块大小：%.1f MB" +'\r\n'+
+		"分块数量：%d" +'\r\n'+
+		"解码帧率：%.1f fps" +'\r\n'+
+		"解码总时间：%.2f 秒" +'\r\n'+
+		"解码等效速率：%s",
+		formatSize(fileSize),
+		modeText,
+		appState.settings.frameRate,
+		chunkMB,
+		chunkCount,
+		decodeFps,
+		totalSec,
+		formatSpeed(speed)
+	);
+
+	win.msgbox(summary, "测试小结", 0x40 /*_MB_ICONINFORMATION*/, mainForm.hwnd);
+};
+
+// 单文件保存（非分块模式）
+saveSingleFile = function(fileId, filename){
+	if(appState.decodeTimer){
+		mainForm.clearInterval(appState.decodeTimer);
+		appState.decodeTimer = null;
+	}
+	mainForm.staticDecode.text = "解码完成！正在保存...";
+
+	var defaultName = filename ? filename : "output.bin";
+	// 文件类型不限，以传递的文件名为默认文件名（测试模式可能传输任意类型文件）
+	var savePath = fsys.dlg.save("All files|*.*||", "保存解码文件", , mainForm.hwnd, , defaultName);
+	var saved = false;
+	var savedSize = 0;
+	if(savePath){
+		if(cimbar.decodeSave(fileId, savePath)){
+			mainForm.staticDecode.text = "文件已保存到：" + savePath;
+			saved = true;
+			savedSize = ..io.fileSize(savePath);
+		}
+		else {
+			mainForm.staticDecode.text = "保存失败！";
+		}
+	}
+	else {
+		mainForm.staticDecode.text = "已取消保存。";
+	}
+
+	// 测试模式：弹出小结对话框（须在 stopAll 之前，stopAll 会清理 testStats）
+	if(appState.testStats && saved){
+		showTestSummary(savedSize, 1);
+	}
+
+	stopAll();
+};
+
+// 设置对话框：调整帧率、冗余倍数、chunk_size
+// 模态对话框，阻塞主窗口直到用户确认（避免编码中修改设置导致状态不一致）
+showSettingsDialog = function(){
+	var dlg = win.form(text="设置"; right=300; bottom=220; parent=mainForm.hwnd; sysmenu=true);
+	dlg.add(
+		label1={cls="static";text="编码帧率 (FPS):";left=20;top=20;right=140;bottom=36;transparent=1};
+		editFrame={cls="edit";left=150;top=16;right=260;bottom=40;edge=1};
+		spinFrame={cls="spin";left=260;top=16;right=290;bottom=40};
+
+		label2={cls="static";text="冗余倍数:";left=20;top=60;right=140;bottom=76;transparent=1};
+		editRedundancy={cls="edit";left=150;top=56;right=260;bottom=80;edge=1};
+		staticHint={cls="static";text="范围 1.23-8.1x（5MB chunk 上限 8.1x）";left=50;top=82;right=320;bottom=98;transparent=1};
+
+		label3={cls="static";text="单块大小 (MB):";left=20;top=110;right=140;bottom=126;transparent=1};
+		comboChunk={cls="combobox";left=150;top=106;right=260;bottom=130;edge=1;mode="dropdown"};
+
+		btnReset={cls="button";text="重置";left=100;top=170;right=180;bottom=195};
+		btnOk={cls="button";text="确定";left=200;top=170;right=280;bottom=195;default=1};
+	);
+
+	// 初始化控件值
+	// spin 控件需显式设置范围、伙伴窗口、初始位置（构造时 range/buddy 属性不可靠）
+	dlg.spinFrame.setRange(5, 20);
+	dlg.spinFrame.buddy = dlg.editFrame;
+	dlg.spinFrame.pos = appState.settings.frameRate;  // 同步初始值，避免首次点击跳到 0
+	dlg.editFrame.text = tostring(appState.settings.frameRate);
+	dlg.editRedundancy.text = tostring(appState.settings.redundancy);
+	dlg.comboChunk.items = {"5"; "10"; "15"; "33"};
+	var chunkMB = appState.settings.chunkSize / 1024 / 1024;
+	dlg.comboChunk.text = tostring(chunkMB);
+
+	// 冗余倍数下限（与原项目 EncoderPlus.h 最低默认值 1.2x 对齐）
+	// 理由：wirehair 理论下限略大于 1.0x，且原项目作者警告 1-2x 太低会导致重复块长期连发
+	var REDUNDANCY_MIN = 1.2;
+
+	// 根据 chunk_size 计算冗余上限（与 manifest-spec.md 对齐）
+	// 5MB→8.1x, 10MB→4.0x, 15MB→2.7x, 33MB→1.23x
+	var getRedundancyLimit = function(chunkMB){
+		if(chunkMB <= 5) return 8.1;
+		if(chunkMB <= 10) return 4.0;
+		if(chunkMB <= 15) return 2.7;
+		return 1.23;  // 33MB
+	};
+
+	// comboChunk 切换时联动更新冗余上限提示
+	dlg.comboChunk.oncommand = function(id, event){
+		var cs = tonumber(dlg.comboChunk.text);
+		if(cs){
+			var limit = getRedundancyLimit(cs);
+			dlg.staticHint.text = ..string.format("范围 %.1f-%.2fx（%dMB chunk 上限 %.2fx）", REDUNDANCY_MIN, limit, cs, limit);
+		}
+	};
+
+	// 重置按钮：只恢复 UI 显示值，不修改 appState.settings，不保存
+	// 用户点确定后才真正生效并保存
+	dlg.btnReset.oncommand = function(id, event){
+		dlg.editFrame.text = "10";
+		dlg.editRedundancy.text = "2.0";
+		dlg.comboChunk.text = "10";
+		dlg.spinFrame.pos = 10;
+		dlg.comboChunk.oncommand(0, 0);  // 联动更新冗余上限提示
+	};
+
+	// 确定按钮：校验范围并保存
+	dlg.btnOk.oncommand = function(id, event){
+		var fr = tonumber(dlg.editFrame.text);
+		var rd = tonumber(dlg.editRedundancy.text);
+		var cs = tonumber(dlg.comboChunk.text);
+		// 容错：转换失败时用默认值
+		if(!fr) fr = 10;
+		if(!rd) rd = 2.0;
+		if(!cs) cs = 10;
+
+		// 范围校验
+		fr = math.max(5, math.min(20, fr));
+		cs = math.max(1, math.min(33, cs));
+		// 冗余倍数：下限 1.2x，上限随 chunk_size 动态变化
+		var rdLimit = getRedundancyLimit(cs);
+		rd = math.max(REDUNDANCY_MIN, math.min(rdLimit, rd));
+
+		appState.settings.frameRate = fr;
+		appState.settings.redundancy = rd;
+		appState.settings.chunkSize = cs * 1024 * 1024;
+
+		saveSettings();
+		dlg.close();
+	};
+
+	// 初始化冗余上限提示（触发一次 comboChunk.oncommand）
+	dlg.comboChunk.oncommand(0, 0);
+
+	dlg.show();
+	win.loopMessage();
 };
 
 startDecoding = function(){
@@ -364,27 +1201,28 @@ startDecoding = function(){
 
 	var mode = getModeValue();
 	dlog("DECODE", "startDecoding: mode=%d", mode);
+	mainForm.staticEncode.text = "";  // 解码模式不需要编码提示
 	if(!cimbar.decodeConfigure(mode)){
 		dlog("DECODE", "decodeConfigure FAILED");
-		mainForm.static.text = "解码配置失败！";
+		mainForm.staticDecode.text = "解码配置失败！";
 		return;
 	}
 	dlog("DECODE", "decodeConfigure OK");
 
 	appState.mode = "decoding";
-	mainForm.static.text = "正在启动摄像头...";
+	mainForm.staticDecode.text = "正在启动摄像头...";
 	mainForm.progress.pos = 0;
 
 	// 使用 Media Foundation 打开摄像头（DLL 内部实现，不依赖 VFW）
 	if(!cimbar.camOpen(0)){
 		dlog("DECODE", "camOpen FAILED");
-		mainForm.static.text = "无法打开摄像头！";
+		mainForm.staticDecode.text = "无法打开摄像头！";
 		appState.mode = "idle";
 		return;
 	}
 	dlog("DECODE", "camOpen OK");
 
-	mainForm.static.text = "摄像头已启动，正在解码...";
+	mainForm.staticDecode.text = "摄像头已启动，正在解码...";
 
 	// 定时器：抓帧 + 预览 + 解码
 	appState.decodeTimer = mainForm.setInterval(100, function(){
@@ -393,6 +1231,9 @@ startDecoding = function(){
 };
 
 decodeOneFrame = function(bmp){
+	// 测试模式下累计解码帧数（用于计算解码帧率）
+	if(appState.testStats) appState.testStats.decodeFrameCount++;
+
 	// 如果未提供 bmp，从摄像头抓取并更新预览
 	if(!bmp){
 		bmp = cimbar.camGrabBitmap();
@@ -434,45 +1275,80 @@ decodeOneFrame = function(bmp){
 	var result = cimbar.decodeFrameFromBitmap(decodeBmp);
 	if(decodeBmp != bmp) decodeBmp.dispose(); // 释放裁剪位图
 
-	dlog("DECODE", "decodeFrame result: %s", result ? (result.fileId ? "fileId=" + result.fileId : "bytesDecoded=" + (result.bytesDecoded || 0)) : "null");
+	// 仅 stream 完成时记录日志（减少高频输出）
+	if(result && result.fileId){
+		dlog("DECODE", "decodeFrame: stream completed, fileId=%d", result.fileId);
+	}
 
+	// 更新进度显示
+	var report = cimbar.getDecodeReport();
 	var progress = cimbar.getDecodeProgress();
-	mainForm.progress.pos = progress;
+	// 测试模式下进度条由编码定时器独占管理（显示编码整体进度）
+	// 解码进度通过 static.text 显示，避免 2x 频率的解码定时器覆盖编码进度
+	if(appState.mode != "testing"){
+		mainForm.progress.pos = progress;
+	}
 
 	var scanResult = cimbar.decodeGetScanResult();
-	if(scanResult == 2){
-		mainForm.static.text = string.format("解码中... 进度:%d%% 请调整距离或对焦", progress);
-	}
-	elseif(scanResult == 1){
-		mainForm.static.text = string.format("解码中... 进度:%d%%", progress);
-	}
-	else {
-		mainForm.static.text = string.format("对齐锚点中... 进度:%d%%", progress);
-	}
 
-	if(result && result.fileId){
-		// 先停定时器，防止继续触发解码
-		if(appState.decodeTimer){
-			mainForm.clearInterval(appState.decodeTimer);
-			appState.decodeTimer = null;
+	// 多 stream 场景显示更详细的进度
+	// 测试模式复用同一套显示逻辑（含锚点质量信息），不再另做 staticDecode
+	if(decodeState.manifest || (appState.mode == "testing" && appState.bigFile)){
+		var done = countDoneChunks();
+		// 优先用 manifest 中的 chunk_count，测试模式无 manifest 时回退到编码侧 totalChunks
+		var total = decodeState.manifest ? decodeState.manifest.chunk_count : appState.bigFile.totalChunks;
+		// chunk 刚完成被 mark_done 后 numStreams 暂时为 0，getDecodeProgress 返回 0
+		// 此时若 done < total，说明在保存/等待下一块，不显示 0%，改用"保存中"提示
+		var dispProgress;
+		var savingHint = false;
+		if(done >= total){
+			dispProgress = 100;
 		}
-		mainForm.static.text = "解码完成！正在保存...";
-
-		// 获取原始文件名作为默认值，默认扩展名为 png
-		var defaultName = cimbar.decodeGetFilename(result.fileId) || "output.png";
-		var savePath = fsys.dlg.save("图像文件|*.png;*.bmp|PNG|*.png|BMP|*.bmp|All files|*.*||", "保存解码文件", , mainForm.hwnd, , defaultName);
-		if(savePath){
-			if(cimbar.decodeSave(result.fileId, savePath)){
-				mainForm.static.text = "文件已保存到：" + savePath;
-			}
-			else {
-				mainForm.static.text = "保存失败！";
-			}
+		elseif(progress > 0){
+			dispProgress = progress;
 		}
 		else {
-			mainForm.static.text = "已取消保存。";
+			// progress==0 且 done<total：chunk 完成正在保存或等待下一块
+			dispProgress = 0;
+			savingHint = true;
 		}
-		stopAll();  // 保存完成后再清理
+		if(scanResult == 2){
+			mainForm.staticDecode.text = ..string.format("解码中 %d/%d 进度:%d%% 请调整对焦", done, total, dispProgress);
+		}
+		elseif(savingHint){
+			mainForm.staticDecode.text = ..string.format("解码中 %d/%d 保存中...", done, total);
+		}
+		elseif(scanResult == 1){
+			mainForm.staticDecode.text = ..string.format("解码中 %d/%d 进度:%d%%", done, total, dispProgress);
+		}
+		else {
+			mainForm.staticDecode.text = ..string.format("对齐锚点中... %d/%d 进度:%d%%", done, total, dispProgress);
+		}
+	}
+	else {
+		if(scanResult == 2){
+			mainForm.staticDecode.text = string.format("解码中... 进度:%d%% 请调整距离或对焦", progress);
+		}
+		elseif(scanResult == 1){
+			mainForm.staticDecode.text = string.format("解码中... 进度:%d%%", progress);
+		}
+		else {
+			mainForm.staticDecode.text = string.format("对齐锚点中... 进度:%d%%", progress);
+		}
+	}
+
+	// 有 stream 完成，交给 handleDecodedStream 处理
+	if(result && result.fileId){
+		dlog("DECODE", "stream completed: fileId=%d, chunks before=%d", result.fileId, countDoneChunks());
+		handleDecodedStream(result.fileId);
+		dlog("DECODE", "stream after: chunks=%d, manifest=%s", countDoneChunks(), decodeState.manifest ? "yes" : "no");
+	}
+
+	// 兜底：每帧解码后检查是否所有 chunk 已完成
+	// 正常情况下 checkAllChunksDone 在 handleDecodedStream 中调用，
+	// 但如果某次 decodeSave 失败跳过了检查，这里作为安全网
+	if(decodeState.manifest && appState.bigFile){
+		checkAllChunksDone();
 	}
 };
 
@@ -489,6 +1365,10 @@ stopAll = function(){
 	cimbar.camClose();
 	cimbar.encodeCleanup();
 	cimbar.decodeCleanup();
+	// 清理大文件分块解码的临时文件和状态
+	resetDecodeState();
+	appState.bigFile = null;
+	appState.testStats = null;  // 清理测试统计
 	if(appState.currentBitmap){
 		appState.currentBitmap.dispose();
 		appState.currentBitmap = null;
@@ -498,11 +1378,16 @@ stopAll = function(){
 		appState.offscreenBitmap = null;
 	}
 	appState.mode = "idle";
+	appState.testArmed = false;  // 清除测试待命状态
 	appState.encodeFilePath = null;
 	appState.encodeBuffer = null;
 	appState.mirrorFlip = false;
 	appState.camZoom = 1.0;
+	mainForm.progress.pos = 0;  // 重置进度条
+	mainForm.staticEncode.text = "试试拖放一个小文件!";
+	mainForm.staticDecode.text = "";
 	drawCanvas();
+	mainForm.invalidate(,1);  // 擦除 mainForm 上的锚点残影
 };
 
 // 阻止系统擦除 custom 控件背景，避免底色闪烁
@@ -555,6 +1440,7 @@ mainForm.custom.wndproc = {
 
 mainForm.onSize = function(width, height, wParam){
 	layoutCustom();
+	mainForm.invalidate(,1);  // 擦除旧锚点残影（eraseBackground=true）
 	drawCanvas();
 };
 
@@ -565,10 +1451,28 @@ mainForm.button1.oncommand = function(id, event){
 	startEncoding(path);
 };
 
-mainForm.button2.oncommand = function(id, event){
-	mainForm.hide();
-	win.delay(300);
+// 齿轮按钮：弹出菜单（设置 / 测试）
+mainForm.button.oncommand = function(id, event){
+	var menu = win.ui.popmenu(mainForm);
+	menu.addTable({
+		{ "设置…"; function(id){
+			showSettingsDialog();
+		}};
+		{ /*分隔线*/ };
+		{ "测试…"; function(id){
+			var ret = win.msgboxTest("是否进行一次端到端测试？"+'\r\n'+"（编码开始后自动截取图像进行解码）", "测试模式", mainForm.hwnd);
+			if(ret){
+				stopAll();
+				appState.testArmed = true;
+				mainForm.staticEncode.text = "测试待命：请打开文件或划区截图开始编码";
+			}
+		}};
+	});
+	menu.popup();
+	menu.close();
+};
 
+mainForm.button2.oncommand = function(id, event){
 	var screenArea = mouse.screenArea();
 	var capturedBuffer = null;
 
@@ -577,7 +1481,8 @@ mainForm.button2.oncommand = function(id, event){
 		capturedBuffer = pngBuffer;
 		screenArea.endModal(true);
 	};
-
+	mainForm.hide();
+	win.delay(100);  // 等待窗口隐藏生效，避免截图包含自身窗口
 	screenArea.doModal();
 	mainForm.show();
 
@@ -588,11 +1493,6 @@ mainForm.button2.oncommand = function(id, event){
 };
 
 mainForm.button3.oncommand = function(id, event){
-	if(string.lower(mainForm.combobox.text) == "test"){
-		var ret = win.msgboxTest("是否进行端到端测试？", "测试模式", mainForm.hwnd);
-		if(ret) runTest();
-		return;
-	}
 	startDecoding();
 };
 
@@ -616,6 +1516,7 @@ var workArea = win.getWorkArea(mainForm.hwnd);
 if(workArea){
 	mm.argsMax = { x = workArea.width(); y = workArea.height() };
 }
+
 
 mainForm.show();
 return win.loopMessage();
